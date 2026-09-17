@@ -60,6 +60,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 20 | [Importação/COMEX, previsão de compra e SIM Carteira](./20-importacao-comex-sim-carteira.md) | `Ret_Aviso_*` (aviso/previsão × pedido), DI (`Fat_Itens_Pedido_DI`/`Liv_EntProd_DI`), saldo de carteira (`Vw_Saldo_Pedido_Carteira_Qlik`) e SIM/Smartsales (`pedido_web`, `*_SPED_Microdata`) | ✔ |
 | 21 | [B.I, Power BI, Qlik e dashboards](./21-bi-power-bi.md) | Views `*_PBI`/`*_Qlik`, banco `DBProDash` (faturamento/DRE/estoque/financeiro), BI nativo Microdata, snapshots de estoque (DGB×MOVEN×COMEX) e a dependência quebrada `DBInternet_DGB` | ✔ |
 | 22 | [Arquitetura de destino (DBProDash → Neon) e carga pela API](./22-arquitetura-neon-etl.md) | Plano de dados/ETL: `DBMicrodata_DGB` (read-only) → API → **Neon/Postgres**; mapa de PKs/watermarks das 40 tabelas-fonte, carga incremental, porte SQL Server→Postgres e convenções | ✔ |
+| 23 | [Financeiro, fluxo de caixa, contábil, fiscal e custo médio](./23-financeiro-contabil-custo.md) | Banco (`Bco_Lancamentos`/cheques), fluxo de caixa (`Fluxo_Caixa` + `SP_Fluxo_GerarFluxoPorEmpresa`), contábil e apuração fiscal **vazios** e custo médio **on-the-fly** (`SP_MCG_Custo_Medio_DGB` sobre `Liv_Entradas/Saidas`) | ✔ |
 
 ## Referência (legado)
 
