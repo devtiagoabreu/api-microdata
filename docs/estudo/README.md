@@ -35,6 +35,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 11 | [Procedures, views e funções](./11-procedures-e-views.md) | Superfície de acesso: 2 352 procs / 530 views; os 15 endpoints do legado; segundo banco `DBProDash` e as views `vwFaturamento`, `VW_Rec_DuplicatasEmAberto`, `VW_Pag_Titulo_Aberto` | ✔ |
 | 12 | [Views do DBProDash](./12-views-dbprodash.md) | Regra de negócio de `vwFaturamento`/`vwContasPagas`/`vwListagemDe*`, contrato das 10 procs de dashboard, escrita escondida no centro de custo (`Rel_CCusto_Niveis`) e recomendação de porte | ✔ |
 | 13 | [Views do DBMicrodata_DGB](./13-views-dbmicrodata.md) | Catálogo das 530 views por módulo; views de negócio reutilizáveis (`VW_CTE_PECA_EM_ABERTO`, `VW_CarPedidosEmAberto`, `VW_Rec_Duplicata(*)`, `VW_Pag_Titulo_Aberto`, `Fornecedores`, `Entidades`) e uso por endpoint | ✔ |
+| 14 | [Módulos de produção e mapa de módulos](./14-modulos-producao-e-mapa.md) | Views `VW_CTE_*`/`VW_PCP_*`/`VW_Cfc_*` e o achado de que produção/PCP/CFC/FIO/TNT/loja/custo estão **vazios** — mapa de tabelas × linhas por módulo | ✔ |
 
 ## Referência (legado)
 
