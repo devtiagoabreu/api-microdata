@@ -65,6 +65,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 25 | [Expedição/armazém: distribuição, separação, coleta, romaneio e despacho](./25-expedicao-despacho-separacao.md) | Módulo `SP_GESTOR_*`/`Car_Efetiva_Distri`, ordem de separação `CAR_SEPARACAO*` (status 0–4), romaneio `Car_Romaneio`/`Car_Itens_Romaneio`, minuta de despacho `Fat_Minuta_Despacho(_Notas)` e transporte em `Fat_Pedido` | ✔ |
 | 26 | [Mapa de módulos da Microdata e relação no banco](./26-mapa-modulos-microdata.md) | 5 003 tabelas em 253 prefixos; módulos core, verticais (têxtil, loja, pneus, varejo…), infra (`SIS/MIC/RPT/LOG`) e as regras de identificação/porte | ✔ |
 | 27 | [Cadastros base (detalhado)](./27-cadastros-base-profundo.md) | Entidade única `Clientes_Principal` (+ satélites, views `Entidades`/`Fornecedores`, `Fnn_Participante`), `Produtos`/`Produtos_Tecidos|Fios|Servicos`, classificação (`Ret_*`), `Empresas`, geografia e auxiliares (transportadora, vendedor, cond. pagto, bancos); row-level security do schema `microdata` | ✔ |
+| 28 | [Carteira/Pedidos (`Car_*`)](./28-carteira-pedidos.md) | Pedido de venda em profundidade: `Car_Pedido`/`Car_Itens_Pedido`/`Car_Vend_Pedido` (PK/FK/índices/status/tipo), satélites (auditoria, cancelamento, previsão, peças), tabela de preço, views da carteira (`VW_Car_Pedido`, `Vw_Car_Itens_Pedido`, `VW_CarPedidosEmAberto`, `Vw_Saldo_Pedido_Carteira_Qlik`) e a ponte `Liv_Diario` empresa de venda ↔ produto | ✔ |
 
 ## Referência (legado)
 
