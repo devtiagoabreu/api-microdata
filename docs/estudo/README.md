@@ -21,6 +21,9 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 - **Neon (PostgreSQL, externo)** — **destino futuro** dos dados. Não tem acesso ao `DBMicrodata_DGB`,
   então **a API em Python** extrai do ERP e **carrega no Neon**; o `DBProDash` é o **protótipo** a ser
   portado. Ver [Estudo 22](./22-arquitetura-neon-etl.md).
+- **`dgbcomex` (Next.js + Vercel, repositório separado)** — camada de produto (dashboards, BI, CRM)
+  que **lê o Neon diretamente** (Prisma/Drizzle); logo o schema do Neon é o **contrato** entre a API
+  (ETL) e o front. Ver [Estudo 22](./22-arquitetura-neon-etl.md).
 
 ## Regras do estudo
 

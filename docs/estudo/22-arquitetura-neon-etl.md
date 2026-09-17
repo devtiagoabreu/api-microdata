@@ -21,21 +21,39 @@ Consequência: **o `DBProDash` é o protótipo/molde** — o que for modelado e 
 ## 2. Arquitetura alvo
 
 ```
-DBMicrodata_DGB (SQL Server, read-only)
+DBMicrodata_DGB (SQL Server, read-only, on-prem)
         |  SELECT (PK, watermark)
         v
   API Python  ──────────────►  Neon / PostgreSQL (externo)
    (extract + transform)          ├── raw    (espelho das fontes, sem regra)
                                   ├── core   (regras portadas do DBProDash)
                                   └── marts  (views _PBI/_Qlik portadas p/ consumo)
-        ^
-        |
-DBProDash (on-prem)  =  PROTÓTIPO das views de "core"/"marts"
+        ^                                 |
+        |                                 |  leitura DIRETA (Prisma/Drizzle, DATABASE_URL)
+DBProDash (on-prem)                       v
+  = PROTÓTIPO das views          dgbcomex (Next.js + Vercel)
+                                   dashboards · BI · CRM · ...
 ```
 
-- A API lê do ERP e carrega no Neon; os consumidores (incl. eventual BI) leem do Neon.
+- A API lê do ERP e carrega no Neon; o **`dgbcomex` lê o Neon direto** (não passa pela API).
 - O `DBProDash` deixa de ser lido em produção pela API; serve de **referência de regra**
   (contrato de negócio já validado).
+
+### 2.1 Camada de consumo: `dgbcomex` (Next.js + Vercel)
+
+- **Repositório separado** (`dgbcomex`), em **Next.js**, hospedado na **Vercel**.
+- **Lê o Neon diretamente**, via driver ORM (Prisma/Drizzle/`postgres.js`) com `DATABASE_URL`
+  (pooled) nas variáveis de ambiente da Vercel.
+- É a camada de **produto/apresentação**: dashboards, BI, CRM e demais telas.
+- Consequências de arquitetura:
+  1. O **Neon é o contrato compartilhado** entre o ETL (Python) e o front (Next.js): as colunas/
+     schemas são API pública de fato.
+  2. O `dgbcomex` só enxerga o que o ETL grava — **nada de acesso ao ERP**.
+  3. **`raw` não deve ser lido pelo front**; expor apenas `core`/`marts` (estáveis e documentados).
+  4. Como o front é **serverless**, usar **connection pooling** do Neon; cargas pesadas de ETL não
+     devem competir com a leitura do front (janela/limite de conexões; considerar read replica).
+  5. **Ownership de migrations**: o schema Neon é alterado **pelo lado do ETL**; mudanças precisam
+     ser compatíveis com o `dgbcomex` (versionar contrato, evitar `DROP`/rename sem etapa de transição).
 
 ## 3. O que replicar para o Neon
 
@@ -162,6 +180,9 @@ dinâmico — **reimplementar em Python**.
 - **Chaves**: `PRIMARY KEY` = chave natural do ERP (após trim); sem surrogate exposto.
 - **Tipos**: datas em `timestamp`/`date`; valores em `numeric`; flags char(1) em `char(1)`/`text`.
 - **Controle**: schema `etl` com `etl.watermark` (tabela, coluna, ultimo_valor) e `etl.execucoes`.
+- **Contrato com o `dgbcomex`**: só `core`/`marts` são expostos; `raw` e `etl` ficam privados.
+  Mudanças de schema devem ser **aditivas e versionadas** (o front lê direto, então rename/drop
+  quebra a Vercel sem aviso).
 
 ## 8. Segurança
 
@@ -179,6 +200,10 @@ dinâmico — **reimplementar em Python**.
 - **Volume**: itens de romaneio (274k), peças baixadas (280k) e bases de peças (297k) dominam a
   carga; planejar carga full inicial fora do horário comercial e incremental por janela.
 - **Fusos/datas**: ERP grava data+hora local; padronizar em `America/Sao_Paulo` na carga.
+- **Leitura direta pelo `dgbcomex`**: sem camada de API entre o Neon e o front, qualquer mudança de
+  schema em `core`/`marts` é **breaking change**; tratar as views como contrato versionado.
+- **Concorrência de conexões**: ETL (Python) e front (Vercel/serverless) disputam o pool do Neon;
+  separar horários/limites e considerar read replica para o front.
 
 ## 10. Próximos passos
 
