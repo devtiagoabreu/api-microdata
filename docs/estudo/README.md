@@ -26,6 +26,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 02 | [Estoque de peças/rolos de tecido](./02-dominio-estoque-pecas.md) | `Cte_Peca`, `CTE_Baixa`, `Produtos_Tecidos`, `Vw_Car_Itens_Pedido` e `uspEnderecamentoParaAtenderPedidoGeral` | ✔ |
 | 03 | [Pedidos e itens de venda](./03-dominio-pedidos-vendas.md) | `Car_Pedido`, `Car_Itens_Pedido`, `Car_Vend_Pedido`, `Clientes_Principal`, `Rec_Vendedores` | ✔ |
 | 04 | [Status dos pedidos e jornada até a NF](./04-status-pedidos-e-fluxo-nf.md) | Decodificação de `Status`/`Status_Ped`/`Status_Item`/`Tipo_Pedido` e fluxo `Car_Romaneio` → `Fat_Pedido` | ✔ |
+| 05 | [Faturamento e contas a receber](./05-faturamento-contas-a-receber.md) | `Notas_Fiscais_Rec`, `Notas_Fiscais_Parcelas`, `Rec_Baixas`, view `Rec_EmAberto` | ✔ |
 
 ## Referência (legado)
 
