@@ -39,6 +39,8 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 15 | [Functions](./15-functions.md) | Catálogo das 194 funções (141 escalares/40 TVF/13 inline, 81 órfãs): parâmetros por empresa, datas úteis, fiscal (EFD/FCI), receber, preço, medidas — e as referenciadas por views | ✔ |
 | 16 | [Triggers](./16-triggers.md) | Catálogo das 672 triggers (285 tabelas; 10 off): trava de fechamento mensal, campos derivados, fan-out de `Produtos`, auditoria — e o que a API read-only deve respeitar | ✔ |
 | 17 | [Cadastros comerciais](./17-cadastros-comerciais.md) | Tabelas de preço (`CAR_TABELA_PRECO*`), condições de pagamento, comissões/vendedores, transportadoras, bancos/cheques/CNAB — e a cadeia de resolução de preço | ✔ |
+| 18 | [Fiscal (Liv_*/EFD/SPED)](./18-fiscal-liv-efd.md) | Livro fiscal de saídas/entradas, importação de NF-e XML, figura fiscal (`Fig_*`), parâmetros (`SIS_Parametros*`) e SPED/EFD | ✔ |
+| 19 | [Estoque de peças (Cte_Peca)](./19-estoque-pecas-cte-peca.md) | `Cte_Peca`/`CTE_Baixa`/`CTE_Saldos`, romaneios de venda e transferência e a regra de "peça em aberto" (`VW_CTE_PECA_EM_ABERTO`) | ✔ |
 
 ## Referência (legado)
 
