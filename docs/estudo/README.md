@@ -9,6 +9,16 @@ produção `DBMicrodata_DGB` (SQL Server 2019). Nesta fase **não são executada
 Servir de base para a construção da nova **API em Python** que disponibilizará dados do ERP
 Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 
+## Bancos (arquitetura)
+
+- **`DBMicrodata_DGB`** — banco do **fornecedor (Microdata)**, de produção. **Não aceita objetos
+  novos** (views/tabelas/procs): é a **fonte somente leitura** do estudo e da nova API.
+- **`DBProDash`** — **camada própria de BI/dashboards** criada internamente porque não se pode
+  criar nada no ERP. Suas views fazem `SELECT` em `DBMicrodata_DGB` (nome de 3 partes) e é o banco
+  onde **se pode criar/manter** views, snapshots e tabelas materializadas. Ver
+  [Estudo 21](./21-bi-power-bi.md).
+- **`DBIntegracao`** — hub de integração/licenciamento da Microdata (tabelas `Conn_*`).
+
 ## Regras do estudo
 
 1. **Somente leitura**: apenas `SELECT`, `sp_help`, `INFORMATION_SCHEMA`, catálogos do `sys`.

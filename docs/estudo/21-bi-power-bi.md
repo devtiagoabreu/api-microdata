@@ -20,6 +20,23 @@ dedicado a dashboards, `DBProDash`. Arquitetura em camadas:
 As views do `DBProDash` acessam o ERP por **nome de 3 partes** (`DBMicrodata_DGB.dbo.*`) — ou
 seja, o BI lê a produção do ERP diretamente (não há data warehouse/cubo separado).
 
+### 1.1 Por que o `DBProDash` existe
+
+O `DBMicrodata_DGB` é o banco do **fornecedor (Microdata)** e **não pode receber objetos novos**
+(views/tabelas/procs) — é uma base de produção gerenciada pelo fornecedor. Por isso o `DBProDash`
+foi criado como **camada própria de BI/dashboards**: todas as suas views são `SELECT` sobre
+`DBMicrodata_DGB.dbo.*`, e é nele (e só nele) que se pode **criar** objetos — views de apoio,
+snapshots de estoque e tabelas materializadas (ex.: `Rel_CCusto_Niveis`, `estoqueDGB`/`estoqueEQUAL`/
+`estoqueMOVEN`, `estoqueDGBAnalitico`).
+
+Consequências práticas:
+
+- `DBMicrodata_DGB` = **fonte somente leitura** (apenas `SELECT`).
+- `DBProDash` = **camada de construção** (pode criar e manter objetos), onde a nova API também pode
+  materializar o que precisar.
+- A regra de negócio fica nas views do `DBProDash`, consumidas pelo Power BI/Qlik e (futuramente)
+  pela nova API.
+
 ## 2. Views `*_PBI` (DBMicrodata_DGB)
 
 Conjunto de **dimensões + fatos** no padrão de modelagem estrela do Power BI.
@@ -168,6 +185,9 @@ O conceito de **estoque futuro/SIM Web** (saldo disponível + previsão por `Dat
    dependem de `DBInternet_DGB`, inexistente. Validar dependências antes de integrar.
 5. As views `_PBI`/`_Qlik` e do `DBProDash` são o **contrato de leitura** que o negócio já consome —
    priorizá-las reduz divergência entre a API e o BI atual.
+6. **Onde a API pode criar objetos**: `DBMicrodata_DGB` é do fornecedor e **não aceita novos
+   objetos**; qualquer materialização/apoio deve ir para o **`DBProDash`** (ou outro banco próprio).
+   A leitura no ERP permanece sempre somente leitura.
 
 ## 9. Contagens de apoio
 
