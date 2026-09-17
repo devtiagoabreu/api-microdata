@@ -18,6 +18,9 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
   onde **se pode criar/manter** views, snapshots e tabelas materializadas. Ver
   [Estudo 21](./21-bi-power-bi.md).
 - **`DBIntegracao`** — hub de integração/licenciamento da Microdata (tabelas `Conn_*`).
+- **Neon (PostgreSQL, externo)** — **destino futuro** dos dados. Não tem acesso ao `DBMicrodata_DGB`,
+  então **a API em Python** extrai do ERP e **carrega no Neon**; o `DBProDash` é o **protótipo** a ser
+  portado. Ver [Estudo 22](./22-arquitetura-neon-etl.md).
 
 ## Regras do estudo
 
@@ -53,6 +56,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 19 | [Estoque de peças (Cte_Peca)](./19-estoque-pecas-cte-peca.md) | `Cte_Peca`/`CTE_Baixa`/`CTE_Saldos`, romaneios de venda e transferência e a regra de "peça em aberto" (`VW_CTE_PECA_EM_ABERTO`) | ✔ |
 | 20 | [Importação/COMEX, previsão de compra e SIM Carteira](./20-importacao-comex-sim-carteira.md) | `Ret_Aviso_*` (aviso/previsão × pedido), DI (`Fat_Itens_Pedido_DI`/`Liv_EntProd_DI`), saldo de carteira (`Vw_Saldo_Pedido_Carteira_Qlik`) e SIM/Smartsales (`pedido_web`, `*_SPED_Microdata`) | ✔ |
 | 21 | [B.I, Power BI, Qlik e dashboards](./21-bi-power-bi.md) | Views `*_PBI`/`*_Qlik`, banco `DBProDash` (faturamento/DRE/estoque/financeiro), BI nativo Microdata, snapshots de estoque (DGB×MOVEN×COMEX) e a dependência quebrada `DBInternet_DGB` | ✔ |
+| 22 | [Arquitetura de destino (DBProDash → Neon) e carga pela API](./22-arquitetura-neon-etl.md) | Plano de dados/ETL: `DBMicrodata_DGB` (read-only) → API → **Neon/Postgres**; mapa de PKs/watermarks das 40 tabelas-fonte, carga incremental, porte SQL Server→Postgres e convenções | ✔ |
 
 ## Referência (legado)
 
