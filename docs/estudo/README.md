@@ -61,6 +61,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 21 | [B.I, Power BI, Qlik e dashboards](./21-bi-power-bi.md) | Views `*_PBI`/`*_Qlik`, banco `DBProDash` (faturamento/DRE/estoque/financeiro), BI nativo Microdata, snapshots de estoque (DGB×MOVEN×COMEX) e a dependência quebrada `DBInternet_DGB` | ✔ |
 | 22 | [Arquitetura de destino (DBProDash → Neon) e carga pela API](./22-arquitetura-neon-etl.md) | Plano de dados/ETL: `DBMicrodata_DGB` (read-only) → API → **Neon/Postgres**; mapa de PKs/watermarks das 40 tabelas-fonte, carga incremental, porte SQL Server→Postgres e convenções | ✔ |
 | 23 | [Financeiro, fluxo de caixa, contábil, fiscal e custo médio](./23-financeiro-contabil-custo.md) | Banco (`Bco_Lancamentos`/cheques), fluxo de caixa (`Fluxo_Caixa` + `SP_Fluxo_GerarFluxoPorEmpresa`), contábil e apuração fiscal **vazios** e custo médio **on-the-fly** (`SP_MCG_Custo_Medio_DGB` sobre `Liv_Entradas/Saidas`) | ✔ |
+| 24 | [Endereçamento de peças (“gavetas”), WMS e COMEX/packing list](./24-enderecamento-gavetas-wms-comex.md) | `Cte_Gaveta`/`Cte_GrupoGaveta` e movimentos (`Cte_Peca_Gaveta_Log`, `CTE_PalmGav_Log`), picking (`uspEnderecamentoParaAtenderPedidoGeral`), volumes/fardos (`retVolumes*`/`Cte_Fardo`), COMEX (`Ret_Aviso_*`, `Fat_XML_DI(_embalagem)`, `CMT_LocalDesembaraco`) e o duplo sentido de “packing list” | ✔ |
 
 ## Referência (legado)
 
