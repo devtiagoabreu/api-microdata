@@ -28,6 +28,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 04 | [Status dos pedidos e jornada até a NF](./04-status-pedidos-e-fluxo-nf.md) | Decodificação de `Status`/`Status_Ped`/`Status_Item`/`Tipo_Pedido` e fluxo `Car_Romaneio` → `Fat_Pedido` | ✔ |
 | 05 | [Faturamento e contas a receber](./05-faturamento-contas-a-receber.md) | `Notas_Fiscais_Rec`, `Notas_Fiscais_Parcelas`, `Rec_Baixas`, view `Rec_EmAberto` | ✔ |
 | 06 | [Contas a pagar](./06-contas-a-pagar.md) | `NF_Entradas`, `NFE_Parcelas`, `Pag_Baixas`, `Pag_ChequesEmi_Duplicata`, `Pag_Historicos`, `Pag_Tipos_Fornecedores` | ✔ |
+| 07 | [Jornada do título a pagar](./07-jornada-conta-a-pagar.md) | Geração do CP (`Gera_Ret_NFEntrada`, `Ret_Lanca_Entradas`, `sp_Gerar_Pagar_SemiPronta`, `SP_Transfere_CP`), rateio `NFE_CCustos_*`, CNAB/SISPAG no CP | ✔ |
 
 ## Referência (legado)
 
