@@ -37,6 +37,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 13 | [Views do DBMicrodata_DGB](./13-views-dbmicrodata.md) | Catálogo das 530 views por módulo; views de negócio reutilizáveis (`VW_CTE_PECA_EM_ABERTO`, `VW_CarPedidosEmAberto`, `VW_Rec_Duplicata(*)`, `VW_Pag_Titulo_Aberto`, `Fornecedores`, `Entidades`) e uso por endpoint | ✔ |
 | 14 | [Módulos de produção e mapa de módulos](./14-modulos-producao-e-mapa.md) | Views `VW_CTE_*`/`VW_PCP_*`/`VW_Cfc_*` e o achado de que produção/PCP/CFC/FIO/TNT/loja/custo estão **vazios** — mapa de tabelas × linhas por módulo | ✔ |
 | 15 | [Functions](./15-functions.md) | Catálogo das 194 funções (141 escalares/40 TVF/13 inline, 81 órfãs): parâmetros por empresa, datas úteis, fiscal (EFD/FCI), receber, preço, medidas — e as referenciadas por views | ✔ |
+| 16 | [Triggers](./16-triggers.md) | Catálogo das 672 triggers (285 tabelas; 10 off): trava de fechamento mensal, campos derivados, fan-out de `Produtos`, auditoria — e o que a API read-only deve respeitar | ✔ |
 
 ## Referência (legado)
 
