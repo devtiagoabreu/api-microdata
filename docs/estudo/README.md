@@ -38,6 +38,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 14 | [Módulos de produção e mapa de módulos](./14-modulos-producao-e-mapa.md) | Views `VW_CTE_*`/`VW_PCP_*`/`VW_Cfc_*` e o achado de que produção/PCP/CFC/FIO/TNT/loja/custo estão **vazios** — mapa de tabelas × linhas por módulo | ✔ |
 | 15 | [Functions](./15-functions.md) | Catálogo das 194 funções (141 escalares/40 TVF/13 inline, 81 órfãs): parâmetros por empresa, datas úteis, fiscal (EFD/FCI), receber, preço, medidas — e as referenciadas por views | ✔ |
 | 16 | [Triggers](./16-triggers.md) | Catálogo das 672 triggers (285 tabelas; 10 off): trava de fechamento mensal, campos derivados, fan-out de `Produtos`, auditoria — e o que a API read-only deve respeitar | ✔ |
+| 17 | [Cadastros comerciais](./17-cadastros-comerciais.md) | Tabelas de preço (`CAR_TABELA_PRECO*`), condições de pagamento, comissões/vendedores, transportadoras, bancos/cheques/CNAB — e a cadeia de resolução de preço | ✔ |
 
 ## Referência (legado)
 
