@@ -32,6 +32,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 08 | [Cadastros base](./08-cadastros-base.md) | `Clientes_Principal` (cliente+fornecedor), `Produtos`/`Produtos_Tecidos`, `Rec_Vendedores`, `Empresas` | ✔ |
 | 09 | [Estoque de peças e livros](./09-estoque-pecas-livros.md) | `CTE_Saldos`, `CTE_Baixa` (Tipo `'V'` ⇔ `Car_Itens_Romaneio`), `CTE_RomTransf`, `CTE_Gaveta`, `Liv_Inventario`/`Liv_Kardex_EmpTerc` | ✔ |
 | 10 | [Compras e recebimento](./10-compras-e-recebimento.md) | `Cmp_*` sem uso; compras reais = `NF_Entradas` (série `U` importação/`NFS` serviço) + importação NF-e (`Liv_XML`) | ✔ |
+| 11 | [Procedures, views e funções](./11-procedures-e-views.md) | Superfície de acesso: 2 352 procs / 530 views; os 15 endpoints do legado; segundo banco `DBProDash` e as views `vwFaturamento`, `VW_Rec_DuplicatasEmAberto`, `VW_Pag_Titulo_Aberto` | ✔ |
 
 ## Referência (legado)
 
