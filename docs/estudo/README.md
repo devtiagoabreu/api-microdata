@@ -31,6 +31,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 07 | [Jornada do título a pagar](./07-jornada-conta-a-pagar.md) | Geração do CP (`Gera_Ret_NFEntrada`, `Ret_Lanca_Entradas`, `sp_Gerar_Pagar_SemiPronta`, `SP_Transfere_CP`), rateio `NFE_CCustos_*`, CNAB/SISPAG no CP | ✔ |
 | 08 | [Cadastros base](./08-cadastros-base.md) | `Clientes_Principal` (cliente+fornecedor), `Produtos`/`Produtos_Tecidos`, `Rec_Vendedores`, `Empresas` | ✔ |
 | 09 | [Estoque de peças e livros](./09-estoque-pecas-livros.md) | `CTE_Saldos`, `CTE_Baixa` (Tipo `'V'` ⇔ `Car_Itens_Romaneio`), `CTE_RomTransf`, `CTE_Gaveta`, `Liv_Inventario`/`Liv_Kardex_EmpTerc` | ✔ |
+| 10 | [Compras e recebimento](./10-compras-e-recebimento.md) | `Cmp_*` sem uso; compras reais = `NF_Entradas` (série `U` importação/`NFS` serviço) + importação NF-e (`Liv_XML`) | ✔ |
 
 ## Referência (legado)
 
