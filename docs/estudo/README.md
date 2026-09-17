@@ -64,6 +64,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 24 | [Endereçamento de peças (“gavetas”), WMS e COMEX/packing list](./24-enderecamento-gavetas-wms-comex.md) | `Cte_Gaveta`/`Cte_GrupoGaveta` e movimentos (`Cte_Peca_Gaveta_Log`, `CTE_PalmGav_Log`), picking (`uspEnderecamentoParaAtenderPedidoGeral`), volumes/fardos (`retVolumes*`/`Cte_Fardo`), COMEX (`Ret_Aviso_*`, `Fat_XML_DI(_embalagem)`, `CMT_LocalDesembaraco`) e o duplo sentido de “packing list” | ✔ |
 | 25 | [Expedição/armazém: distribuição, separação, coleta, romaneio e despacho](./25-expedicao-despacho-separacao.md) | Módulo `SP_GESTOR_*`/`Car_Efetiva_Distri`, ordem de separação `CAR_SEPARACAO*` (status 0–4), romaneio `Car_Romaneio`/`Car_Itens_Romaneio`, minuta de despacho `Fat_Minuta_Despacho(_Notas)` e transporte em `Fat_Pedido` | ✔ |
 | 26 | [Mapa de módulos da Microdata e relação no banco](./26-mapa-modulos-microdata.md) | 5 003 tabelas em 253 prefixos; módulos core, verticais (têxtil, loja, pneus, varejo…), infra (`SIS/MIC/RPT/LOG`) e as regras de identificação/porte | ✔ |
+| 27 | [Cadastros base (detalhado)](./27-cadastros-base-profundo.md) | Entidade única `Clientes_Principal` (+ satélites, views `Entidades`/`Fornecedores`, `Fnn_Participante`), `Produtos`/`Produtos_Tecidos|Fios|Servicos`, classificação (`Ret_*`), `Empresas`, geografia e auxiliares (transportadora, vendedor, cond. pagto, bancos); row-level security do schema `microdata` | ✔ |
 
 ## Referência (legado)
 
