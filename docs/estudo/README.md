@@ -41,6 +41,7 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 17 | [Cadastros comerciais](./17-cadastros-comerciais.md) | Tabelas de preço (`CAR_TABELA_PRECO*`), condições de pagamento, comissões/vendedores, transportadoras, bancos/cheques/CNAB — e a cadeia de resolução de preço | ✔ |
 | 18 | [Fiscal (Liv_*/EFD/SPED)](./18-fiscal-liv-efd.md) | Livro fiscal de saídas/entradas, importação de NF-e XML, figura fiscal (`Fig_*`), parâmetros (`SIS_Parametros*`) e SPED/EFD | ✔ |
 | 19 | [Estoque de peças (Cte_Peca)](./19-estoque-pecas-cte-peca.md) | `Cte_Peca`/`CTE_Baixa`/`CTE_Saldos`, romaneios de venda e transferência e a regra de "peça em aberto" (`VW_CTE_PECA_EM_ABERTO`) | ✔ |
+| 20 | [Importação/COMEX, previsão de compra e SIM Carteira](./20-importacao-comex-sim-carteira.md) | `Ret_Aviso_*` (aviso/previsão × pedido), DI (`Fat_Itens_Pedido_DI`/`Liv_EntProd_DI`), saldo de carteira (`Vw_Saldo_Pedido_Carteira_Qlik`) e SIM/Smartsales (`pedido_web`, `*_SPED_Microdata`) | ✔ |
 
 ## Referência (legado)
 
