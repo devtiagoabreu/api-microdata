@@ -81,6 +81,12 @@ Microdata (substituindo a API legada que está em `docs/legado/oraculum`).
 | 41 | [Usuários, Acessos e Segurança (Usua)](./41-usuarios-acessos-seguranca.md) | Dois domínios: **ERP** `Usuarios` (39; `Senha` XOR legado + `senha_crypt` hex 40/SHA-1 — não reusar) + ACL `Usuario_Acessos` (19 748, Habilitar/INCLUI/ALTERA/EXCLUI por Sistema×Tópico), catálogo `Sistemas` (~64 módulos: 100 SIMRec, 170 SIMFatura, 220 SIMRet, 250 SIMTecidos, 201 meu Microdata…) e `Topicos`; **portal web** `usuario` (35, representantes; **senha em texto claro** — risco crítico) + `menu`/`menu_it` JSF + `usuario_menu` (911) + `perfil_usuario` (16). Logs: `Log_Acesso` (539, retenção ~30d, ativo set/2026), `Log_Sistema` (90 556) e `*_Log` por módulo. Orientação: auth própria (JWT+bcrypt), escopos a partir dos tópicos, multiempresa via `microdata` RLS | ✔ |
 | 42 | [Infraestrutura (topologia, parametrização, SIMConnect, replicação, agendadores)](./42-infra-topologia-infraestrutura.md) | Servidor multi-tenant com **42 bases**: `DBMicrodata_*` (16 ERPs +2 `_Log`, DGB = 5 004 tabelas) + `DBCon_*` (19, integração `Trn_*`) + `DBInternet_*` (3 — **DGB não tem** `Etc_Parametros`) + `DBIntegracao` (central SIMConnect: licenças, endpoints, `Conn_TabelaIBPT`) + `DBProDash` (BI avulso, descartável→Neon). `Empresas` (5; `'13'` DGB Camboriú/SC, `Id_Empresa=4`) + RLS `microdata.Empresas` (login SUSER_NAME; sem vínculo = vê tudo). SIMConnect: `Conn_*` (licença REST, timers), `Mic_Filtro`, `mic_ChangeLog/ExecutionLog`. Replicação: `SP_CTE_ReplicacaoFTJob`, `Ret_EnviaPedidoCompra`, `Trn_NotaFiscal`. Agendadores: `Rep_Agendamentos`, `Loj_Agendamentos`, `agenda`. **Fim do mapa de módulos (03–42)**; próx.: arquitetura/ETL → Neon | ✔ |
 
+## Arquitetura da nova API (fase de design)
+
+Documentos de design em [`docs/arquitetura`](../arquitetura/README.md): [43 — Arquitetura alvo
+(Neon)](../arquitetura/43-arquitetura-alvo-api.md) e [44 — Contratos da API (mapa do legado →
+Neon)](../arquitetura/44-contratos-api-oraculum.md).
+
 ## Referência (legado)
 
 A API antiga está preservada em [`docs/legado/oraculum`](../legado/oraculum/README.md) e é
