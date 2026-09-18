@@ -7,6 +7,7 @@ alinhados ao plano de dados do [Estudo 22](../estudo/22-arquitetura-neon-etl.md)
 |---|-----------|----------|--------|
 | 43 | [Arquitetura alvo da nova API](./43-arquitetura-alvo-api.md) | Legado `oraculum` → Neon (`raw`/`core`/`marts`/`etl`), ETL incremental, API lendo Neon, roadmap | ✔ |
 | 44 | [Contratos da API](./44-contratos-api-oraculum.md) | 17 rotas do legado mapeadas → fonte ERP → mart Neon → contrato JSON | ✔ |
+| 45 | [Plano de implementação](./45-plano-de-implementacao.md) | Tudo a fazer (fases B–F), decisões pendentes (D1–D8), estrutura do `app/`, ordem de execução, critérios de aceite | ✔ |
 
 Contexto nos estudos: [Estudo 21 (BI/DBProDash)](../estudo/21-bi-power-bi.md),
 [Estudo 22 (arquitetura Neon/ETL)](../estudo/22-arquitetura-neon-etl.md),
