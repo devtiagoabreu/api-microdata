@@ -183,7 +183,7 @@ A empresa **`13`** (têxtil/fiação) é a que usa o módulo de fato (`Ramo_Fio=
 - **Pedido de compra (SC):** `Ret_PedCompra`, `Ret_ItensPedCompra`, `Ret_PedCompra_NFE`,
   `Ret_PedCompra_Trocas`, `Ret_PedCompra_Bonificacao`, `Ret_Parcela_PedCompra` — 0.
   Procs `Ret_EnviaPedidoCompra`/`Ret_EnviaUmPedidoCompra`/`Ret_EnviaStatusPedCompra`
-  (integração) existem, mas `Ret_ParamEmp_Ext. Usar_PedCompra='N'`.
+  (integração) existem, mas `Ret_ParamEmp_Ext.Usar_PedCompra='N'`.
 - **Inventário:** `Ret_Inventario`, `Ret_Inventario_Log`, `Ret_PalmInventar` — 0
   (o inventário real é `Liv_Inventario`, [Estudo 34](./34-estoque-cte-saldos-movimentos.md)).
 - **Trocas/devoluções:** `Ret_Movimentos_Troca`, `Ret_Digita_Troca(_Log)`, `Ret_Saida_Troca`,
@@ -224,7 +224,7 @@ A empresa **`13`** (têxtil/fiação) é a que usa o módulo de fato (`Ramo_Fio=
   `Ret_RelMaxMin`, `Ret_RelMargemBruta(_Resumo)`, `Ret_RelListPrecos(_Custos)`,
   `Ret_RelPrecosAlterados`, `Ret_RelProdutos`, `Ret_RelCompValores`, `Ret_RelSemMov`,
   `Ret_RelSaldoSemVenda`, `Ret_RelPedCompra`, `Ret_RelBlocoEstoquePedido`,
-  `Ret_CFC_RelLancamentos(2)`, `Ret_RelDataUltimaCompra`, `Ret_RelConsulta`,
+  `Ret_CFC_RelLancamentos(2)`, `Ret_RelConsulta`,
   `Ret_RelPlanilha`, `Ret_RelRegInventario`, `Ret_RelDataUltimaCompra`, `RetVSaldos(2)`,
   `RetVCustos(2)`, `Ret_Compara_Inventario`.
 - Escrita/processo: `Ret_Lanca_Entradas` (11 KB — lança entradas), `Ret_GeraInventario`,
