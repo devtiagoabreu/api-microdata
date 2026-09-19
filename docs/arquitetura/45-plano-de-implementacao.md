@@ -27,7 +27,9 @@ F. Cutover e descomissionamento   → dgbcomex no Neon, DBProDash fora
 ```
 
 Regra transversal (manter sempre): **nunca** escrever no `DBMicrodata_DGB`; credenciais só em
-`.env` gitignored; schema `core`/`marts` do Neon = contrato (mudanças aditivas e versionadas).
+`.env` gitignored; schema `core`/`marts` do Neon = contrato (mudanças aditivas e versionadas);
+**o `public` do Neon é do app dgbcomex** (drizzle) — o api-microdata não altera nada lá e cria
+somente `raw`/`core`/`marts`/`etl`.
 
 ---
 
@@ -35,8 +37,8 @@ Regra transversal (manter sempre): **nunca** escrever no `DBMicrodata_DGB`; cred
 
 | # | Decisão | Opções | Recomendação | Bloqueia |
 |---|---------|--------|--------------|----------|
-| D1 | **Neon**: criar projeto/database/branch | Branches por fase (dev/prod) | 1 db dev para esta fase (dados de teste sem valor real) | B,C |
-| D2 | **Credenciais** do Neon | `DATABASE_URL` no `.env` local (gitignored) | pooled URL para dev; separar depois | B |
+| D1 | **Neon**: criar projeto/database/branch | Branches por fase (dev/prod) | ✔ **resolvida**: Neon `dgbcomex` já criado e migrado (118 tabelas em `public`) | B,C |
+| D2 | **Credenciais** do Neon | `DATABASE_URL` no `.env` local (gitignored) | ✔ **resolvida**: `DATABASE_URL` (+ `DB_*` do ERP) no `app/.env` e no `dgbcomex/.env.local` | B |
 | D3 | **Runner do ETL** | VM on-prem (mesma rede do ERP) / máquina dev / CI | VM on-prem com cron; máquina dev para desenvolver | C |
 | D4 | **Frequência do ETL** | diária / horária / on-demand | diária fora do expediente; estoque de peças pode ter janela extra | C,D |
 | D5 | **Auth do alvo** | reusar tabela `usuario` (senha em **texto claro** — ruim) vs auth nova JWT+bcrypt | **auth nova** (JWT+bcrypt), escopos derivados de `Usuario_Acessos` | E |
@@ -60,14 +62,15 @@ app/
 ├─ pyproject.toml              # deps: fastapi, uvicorn, pydantic(-settings), pyodbc,
 │                              #       psycopg[binary], SQLAlchemy, alembic, reportlab,
 │                              #       bcrypt, PyJWT, python-dateutil, python-dotenv
-├─ alembic/                    # migrations do Neon (env.py, versions/)
-│  └─ env.py
+├─ alembic/                    # migrations do Neon — SOMENTE schemas raw/core/marts/etl
+│  └─ env.py                   # public NÃO é gerenciado aqui (é do app dgbcomex/drizzle)
 ├─ .env                        # gitignored (DB_* do ERP + DATABASE_URL do Neon)
 ├─ src/
 │  ├─ config.py                # pydantic-settings; carrega .env
 │  ├─ db/
 │  │  ├─ erp.py                # pyodbc → DBMicrodata_DGB (somente leitura)
-│  │  └─ neon.py               # engine SQLAlchemy + pooling Neon
+│  │  └─ neon.py               # engine SQLAlchemy + pooling Neon (schemas raw/core/marts/etl)
+│  ├─ integracao/              # leitura de public (produto dgbcomex) via marts, sem DDL/DML ali
 │  ├─ etl/
 │  │  ├─ bootstrap.py          # carga full em ordem de dependência
 │  │  ├─ incremental.py        # por watermark / por documento-pai
@@ -200,7 +203,9 @@ Critério de aceite F: `dgbcomex` operando só no Neon; legado desligado sem per
 
 ## 8. Próximas ações imediatas (ordem)
 
-- [ ] Confirmar **decisões D1–D4** (Neon, credenciais, runner, frequência) — necessário p/ começar.
+- [x] Neon `dgbcomex` criado e **`public` migrado** (118 tabelas) via `npm run db:migrate:all` no repo dgbcomex.
+- [x] Seed do dgbcomex executado no Neon (4 usuários demo + menus).
+- [ ] Confirmar **decisões D3–D4** (runner do ETL, frequência) — necessárias p/ começar a carga.
 - [ ] Criar `app/` com pyproject + venv + deps; `.env` com `DATABASE_URL`.
 - [ ] Alembic: migrations 0001–0004 (schemas vazios) e subir no Neon de dev.
 - [ ] Módulo `db/erp.py` (conexão read-only) + prova de conceito de extract de 1 domínio (ex. `Fat_Pedido`).
@@ -218,6 +223,11 @@ Critério de aceite F: `dgbcomex` operando só no Neon; legado desligado sem per
 - **Dependência de rede**: runner do ETL precisa alcançar `10.156.0.124` (ERP on-prem).
 - **Auth nova**: migrar usuários/escopos (do `Usuario_Acessos`) é trabalho próprio — iniciar cedo.
 - **Contrato do front**: mudanças em `core`/`marts` do Neon quebram o `dgbcomex` — aditivo e versionado.
+- **`public` compartilhado**: o Neon já tem dados do produto (118 tabelas em `public`); o
+  api-microdata só tem esquemas próprios e **nunca** altera `public` — integrações ficam em `marts`.
+- **Bootstrap do Neon já feito** (setup): estrutura do `public` criada por `scripts/migrate.js`
+  + `apply-drizzle-migrations.js` + seed (4 usuários demo) — nada disso é responsabilidade do
+  api-microdata.
 
 ---
 

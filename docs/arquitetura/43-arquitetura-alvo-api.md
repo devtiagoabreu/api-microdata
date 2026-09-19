@@ -83,15 +83,34 @@ DBProDash (on-prem) = PROTÓTIPO/referência de regra (deixa de ser lido em prod
 3. **Upsert** pela **chave natural do ERP** (após trim), nunca surrogate.
 4. **`etl.watermark`** registra por tabela: coluna, último valor, execução, status, linhas, duração.
 5. **Reconciliação** periódica (full leve) para baixas/exclusões sem flag (ex.: `CTE_Baixa`, `Pag_Baixas`).
+6. **Camada de produto `public`**: gerida pelo app dgbcomex (drizzle); o api-microdata **lê** quando
+   precisa (marts de integração) e **nunca escreve** ali.
 
 ### 2.3 Modelo de schemas no Neon
 
-| Schema | Conteúdo | Quem lê |
-|--------|----------|---------|
-| `raw` | Espelho fiel das tabelas-fonte contratadas (colunas originais, `trim`), com colunas de rastreio | somente ETL |
-| `core` | Regras portadas das views do `DBProDash` (`vwFaturamento`, `vwContasPagas`, `vwFinanceiroContasReceber/Pagar`, custos) | marts + API |
-| `marts` | Views de consumo do `dgbcomex` e da API (KPIs diários, estoque em aberto) | dgbcomex + API |
-| `etl` | `watermark`, `execucoes`, `erros`, versionamento | somente ETL |
+O Neon é **um único banco** (`dgbcomex`) compartilhado entre o produto dgbcomex e a camada de dados:
+
+| Schema | Conteúdo | Quem lê | Dono |
+|--------|----------|---------|------|
+| `public` | **Dados do produto dgbcomex** (drizzle): `usuarios`, `clientes`, `produtos_cru`, `romaneios`, `romaneio_pecas`, CRM (`crm_pessoas`, `crm_visitas`, `crm_faturamentos`, `crm_pedidos_venda`…), `chamados`/`tickets`, `processos` (BPMN), `email_*`, `fornecedores`, `config_*` — ***não gerenciado pelo api-microdata*** | dgbcomex (Drizzle) | app dgbcomex |
+| `raw` | Espelho fiel das tabelas-fonte do ERP contratadas (colunas originais, `trim`), com colunas de rastreio | somente ETL | api-microdata |
+| `core` | Regras portadas das views do `DBProDash` (`vwFaturamento`, `vwContasPagas`, `vwFinanceiroContasReceber/Pagar`, custos) | marts + API | api-microdata |
+| `marts` | Views de consumo do `dgbcomex` e da API (KPIs diários, estoque em aberto) | dgbcomex + API | api-microdata |
+| `etl` | `watermark`, `execucoes`, `erros`, versionamento | somente ETL | api-microdata |
+
+#### 2.3.1 Regra de coexistência com `public`
+
+O schema `public` contém **dados de negócio gerados pelo produto** (alguns já integrados com o
+ERP via coluna `id_integracao` e com `id` numérico do ERP no `codigo_pdm`). Para nunca colidir:
+
+- **O api-microdata só toca `raw`/`core`/`marts`/`etl`**; qualquer DDL/DML em `public` é do app.
+- **Join bidirecional** (dados do ERP ↔ dados do produto) é via `marts` que leem `raw` +
+  `public` (ex.: `marts.clientes_dgbcomex_erp` juntando `public.clientes` (CNPJ) com
+  `raw.clientes_principal`).
+- O **ETL nunca grava** em `public`; quando um dado do ERP não existe no produto (ou vice-versa),
+  o `marts` entrega com o lado ausente nulo — o app decide como materializar.
+- Mudanças em `raw`/`core`/`marts` são **aditivas e versionadas**; **nunca** `DROP`/`TRUNCATE`
+  em objeto que o `dgbcomex` lê, e **nenhum objeto de `public` é alterado pelo api-microdata**.
 
 Convenções (reaproveitando [Estudo 22 §7](../estudo/22-arquitetura-neon-etl.md)):
 - identificadores `snake_case` minúsculos; chaves = chave natural do ERP após `trim`.
@@ -141,6 +160,11 @@ SQL proprietário → padrões PostgreSQL: [checklist completo no Estudo 22 §6]
 4. **Runner ETL on-prem** precisa alcançar `10.156.0.124` (VPN/VM própria) — não roda na Vercel.
 5. **Segredos** (ERP e Neon) apenas em `.env` gitignored; a API autentica no ERP read-only
    e no Neon como owner da camada própria.
+6. **Coexistência com `public`**: o Neon `dgbcomex` já tem o schema `public` do produto (118
+   tabelas, drizzle). O api-microdata deve respeitar esquemas próprios (`raw/core/marts/etl`) e
+   **nunca** alterar `public`; integrações de dados (ERP ↔ produto) são materializadas via `marts`.
+7. **Migrações aditivas**: `alembic` cria somente objetos novos nos schemas do api-microdata;
+   é proibido `DROP`/`ALTER` em objetos que o `dgbcomex` lê em `public`.
 
 ---
 
