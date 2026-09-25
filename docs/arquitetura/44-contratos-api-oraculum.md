@@ -1,9 +1,12 @@
-# Contratos da API (mapeamento legado `oraculum` → Neon)
+# Contratos da API (mapeamento legado `oraculum` → Postgres local + Neon)
 
-> **Data:** 19/set/2026
+> **Data:** 19/set/2026 (atualizado 25/set/2026)
 > **Escopo:** catálogo das rotas da API legada `docs/legado/oraculum/src/main.py` (+
 > `main_funcional_01.py` e `database.py`), com a fonte no legado, a tabela/view do ERP/BI e o
-> **mart Neon** que a substitui. Todo endpoint do alvo lê **Neon**, nunca o ERP.
+> **mart (warehouse local)** que a substitui. O **Postgres local** (`dgbcomex_warehouse`) é a
+> fonte de verdade dos endpoints; **somente agregados pequenos de dashboard** são sincronizados
+> on-demand para o **Neon** (ver [Doc 43](./43-arquitetura-alvo-api.md)). Todo endpoint do alvo lê
+> o warehouse local, **nunca** o ERP.
 > **Fonte dos dados:** recon executado em 19/set/2026 sobre `DBProDash` (defs de `sys.sql_modules`)
 > e o SQL preservado em `docs/legado/oraculum`.
 
@@ -19,8 +22,9 @@
 | Negócio (KPIs/dashboard) | `/faturamento/{data}`, `/faturamento-dia/{data}`, `/contas-pagas/{data}`, `/custos-administrativos-anual`, `/custos-administrativos-mensal`, `/descontos/{data}`, `/devolucoes/{data}`, `/estornos/{data}`, `/contas-receber-programado`, `/contas-pagar-programado`, `/dashboard-completo/{data}` | 11 |
 | Infra/dev | `/health`, `/procedures`, `/test-procedure/{procedure_name}` | 3 |
 
-Das 17: **14 ficam no alvo** (re-exposição lendo Neon), `/health` é redefinido (sonda o Neon + ETL)
-e **`/test-procedure` e `/procedures` são eliminados** (pass-through de `EXEC` e inventário interno).
+Das 17: **14 ficam no alvo** (re-exposição lendo o **warehouse local**), `/health` é redefinido
+(sonda Postgres local + status ETL) e **`/test-procedure` e `/procedures` são eliminados**
+(pass-through de `EXEC` e inventário interno).
 
 Conexão atual (`database.py`): pyodbc → `DB_SERVER/DB_DATABASE` (SQL Server), uma conexão por
 request; datas no padrão `DDMMYYYY` convertidas para `DD/MM/YYYY` (`formatar_data_para_sql`).
@@ -29,12 +33,12 @@ request; datas no padrão `DDMMYYYY` convertidas para `DD/MM/YYYY` (`formatar_da
 
 ## 2. Contratos de negócio (endpoint a endpoint)
 
-> Legenda: **Fonte ERP** = tabelas/views que alimentam o dado; **Mart Neon** = schema/objeto alvo.
-> `?` = contrato a confirmar com o negócio.
+> Legenda: **Fonte ERP** = tabelas/views que alimentam o dado; **Mart (warehouse local)** = objeto
+> no Postgres local `dgbcomex_warehouse` (schemas `core`/`marts`). `?` = contrato a confirmar com o negócio.
 
 ### 2.1 Estoque de peças / endereçamento (lê `DBMicrodata_DGB`)
 
-| # | Rota | Fonte no legado | Fonte ERP | Mart Neon | Contrato JSON (alvo) | Notas |
+| # | Rota | Fonte no legado | Fonte ERP | Mart (warehouse local) | Contrato JSON (alvo) | Notas |
 |---|------|-----------------|-----------|-----------|----------------------|-------|
 | 1 | `GET /dados` | Query inline (`main.py:35`) — `Cte_Peca` ⨝ `CTE_Baixa` (antijoin) ⨝ `Produtos_Tecidos`, `WHERE Nro_Rolo_Origem IS NULL AND CB.Empresa IS NULL` (peças em aberto) | `Cte_Peca`, `CTE_Baixa`, `Produtos_Tecidos` (Estudos 19/34) | `core.estoque_pecas_em_aberto` (grão peça: `Empresa/Situacao/Nro_Rolo/Nro_Peca` + `Linha` de `Produtos_Tecidos`) | array de `{Lote_Interno, Aviso, Gaveta, SubLote, Situacao, Nro_Rolo, Nro_Peca, Produto, Categoria, Categoria_Tinto, Cor, Desenho, Variante, Largura, Metros, Peso, Rolo_Packlist, Data_Entrada, Chave, Num_Etq_Aux, Linha}` | **Sem paginação no legado** (~300k peças `fetchall`); alvo com **cursor** + filtros opcionais (produto/cor/situação). `Chave = Nro_Rolo+Situacao+Cor+Desenho` (concatenação ambígua) → derivar com separador. Campos `char` com padding → `trim` |
 | 2 | `GET /sugestao-rolos/{pedido}` | `EXEC DBMicrodata_DGB.dbo.uspEnderecamentoParaAtenderPedidoGeral @Pedido char(8)` — para cada item do pedido, acumula rolos em aberto até `Qtde_Saldo` (janela por `Gaveta/Tear DESC/Nro_Rolo DESC`) | `Vw_Car_Itens_Pedido`, `Cte_Peca`, `CTE_Baixa` (Estudos 28/34) | `core.sugestao_rolos` — **reimplementação em Python** da lógica (window `SUM(Metros) OVER`); fonte = mart de peças em aberto + pedido) | array de `{Produto, Cor, Qtde_Item, Qtde_Saldo, Sublote, Gavetas, Rolos, Qtde_Pecas, Total_Metros}` | Parâmetro `char(8)`; legado com `CURSOR` + `FOR XML PATH` (não portar). Gd: tolerância `ABS(Soma-Saldo)<0.01`. Opção on-demand read-only do ERP como fallback |
@@ -42,7 +46,7 @@ request; datas no padrão `DDMMYYYY` convertidas para `DD/MM/YYYY` (`formatar_da
 
 ### 2.2 KPIs do dashboard (lê `DBProDash` — BI a portar)
 
-| # | Rota | Proc legado (DBProDash) | Regra (fonte atual) | Fonte ERP (via view) | Mart Neon | Contrato JSON (alvo) | Notas |
+| # | Rota | Proc legado (DBProDash) | Regra (fonte atual) | Fonte ERP (via view) | Mart (warehouse local) | Contrato JSON (alvo) | Notas |
 |---|------|--------------------------|----------------------|----------------------|----------|----------------------|-------|
 | 4 | `GET /faturamento/{data}` | `uspFaturamento` | `SUM(Vr_Total)+SUM(Acres_Desc) AS Faturamento` por **mês** da `Data_Nota` (`EOMONTH`) | `vwFaturamento` → `Fat_Pedido`, `Fat_Itens_Pedido`, `Fat_Nat_Pedido`, `Produtos_Tecidos`, `Clientes_Principal` (Estudo 29) | `marts.faturamento_diario` (`data_emissao`, `vr_total`, `acres_desc`, `metros` QMP, `vr_nota`) | `{"Faturamento": number}` | Janela de mês calculada na carga; parâmetro passa a **ISO** |
 | 5 | `GET /faturamento-dia/{data}` | `uspFaturamentoDia` | idem por **dia** (`Data_Nota = data`), `ISNULL(...,0)` | idem | `marts.faturamento_diario` | `{"Faturamento": number}` | |
@@ -60,7 +64,7 @@ request; datas no padrão `DDMMYYYY` convertidas para `DD/MM/YYYY` (`formatar_da
 
 | # | Rota | Legado | Alvo |
 |---|------|--------|------|
-| 15 | `GET /health` | `SELECT 1` no SQL Server | Sonda **Neon** (`SELECT 1`) + latência + status `etl.watermark` (última execução por tabela, atraso) |
+| 15 | `GET /health` | `SELECT 1` no SQL Server | Sonda **Postgres local** (`SELECT 1`) + latência + status `etl.watermark` (última execução por tabela, atraso) |
 | 16 | `GET /test-procedure/{name}` | `EXEC DBProDash.dbo.{name}` genérico | **Eliminar** (porta de fuga/execução arbitrária) |
 | 17 | `GET /procedures` | lista estática de procs | **Eliminar** (inventário interno) |
 
@@ -81,30 +85,32 @@ request; datas no padrão `DDMMYYYY` convertidas para `DD/MM/YYYY` (`formatar_da
 
 ---
 
-## 4. Catálogo de marts Neon resultante
+## 4. Catálogo de marts no Postgres local resultante
 
-| Mart (schema) | Grão | Alimenta endpoints |
-|---------------|------|--------------------|
-| `core.estoque_pecas_em_aberto` | peça (`Empresa,Situacao,Nro_Rolo,Nro_Peca`) | 1, 2, 3 |
-| `core.sugestao_rolos` | pedido×produto×cor (computado) | 2, 3 |
-| `marts.faturamento_diario` | dia (`data_emissao`) | 4, 5, 9, 14 |
-| `marts.contas_pagas_diario` | dia (`data_baixa`) | 6, 14 |
-| `marts.custos_por_departamento_mensal` | mês×despesa×departamento | 7, 8, 14 |
-| `marts.devolucoes_diario` | dia×cfop | 10, 14 |
-| `marts.estornos_diario` | dia | 11, 14 |
-| `core.financeiro_receber_programado` / `core.financeiro_pagar_programado` | título a vencer | 12, 13, 14 |
+| Mart (schema) | Grão | Alimenta endpoints | Sync p/ Neon |
+|---------------|------|--------------------|--------------|
+| `core.estoque_pecas_em_aberto` | peça (`Empresa,Situacao,Nro_Rolo,Nro_Peca`) | 1, 2, 3 | não (volume pesado) |
+| `core.sugestao_rolos` | pedido×produto×cor (computado) | 2, 3 | não |
+| `marts.faturamento_diario` | dia (`data_emissao`) | 4, 5, 9, 14 | sim (KPI agregado) |
+| `marts.contas_pagas_diario` | dia (`data_baixa`) | 6, 14 | sim (resumo) |
+| `marts.custos_por_departamento_mensal` | mês×despesa×departamento | 7, 8, 14 | sim (resumo) |
+| `marts.devolucoes_diario` | dia×cfop | 10, 14 | sim (KPI agregado) |
+| `marts.estornos_diario` | dia | 11, 14 | sim (KPI agregado) |
+| `core.financeiro_receber_programado` / `core.financeiro_pagar_programado` | título a vencer | 12, 13, 14 | sim (resumo) |
 
-Camadas: `raw` (fontes), `core` (regras), `marts` (consumo) e `etl` (controle) — detalhes e
-convenções no [Doc 43](./43-arquitetura-alvo-api.md) e no [Estudo 22](../estudo/22-arquitetura-neon-etl.md).
+Camadas (no Postgres local): `raw` (fontes), `core` (regras), `marts` (consumo) e `etl` (controle).
+No **Neon** só sobem os agregados marcados como "sim", em objetos próprios da API (nunca em
+`public`). Detalhes e convenções no [Doc 43](./43-arquitetura-alvo-api.md) e no
+[Estudo 22](../estudo/22-arquitetura-neon-etl.md).
 
 ---
 
 ## 5. Validação do contrato (cutover)
 
-1. Para cada KPI (#4–#13), comparar valor **legado on-prem** × **mart Neon** para os mesmos
-   períodos (amostras: mês corrente + 12 meses) — divergência aceitável < 0.01.
+1. Para cada KPI (#4–#13), comparar valor **legado on-prem** × **mart do Postgres local** para os
+   mesmos períodos (amostras: mês corrente + 12 meses) — divergência aceitável < 0.01.
 2. Para #1/#2/#3, comparar conjunto de rolos sugeridos para 10 pedidos reais.
-3. Só então apontar o `dgbcomex` para o Neon e descomissionar `DBProDash`.
+3. Só então publicar os agregados sincronizados no **Neon** (objetos da API) e descomissionar `DBProDash`.
 
 ---
 

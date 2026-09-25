@@ -19,17 +19,18 @@ Concluído (Fase A):
 A partir daqui, **na ordem**, faremos:
 
 ```
-B. Scaffold do projeto (app/)      → código base + schemas Neon
-C. ETL: bootstrap raw + incremental → dados no Neon
-D. core/marts (regras de negócio)  → o "DBProDash" portado
-E. Endpoints da API lendo Neon    → substitui o oraculum (14 contratos)
-F. Cutover e descomissionamento   → dgbcomex no Neon, DBProDash fora
+B. Scaffold do projeto (app/)      → código base + schemas (Postgres local + Neon)
+C. ETL: bootstrap raw + incremental → warehouse no Postgres LOCAL
+D. core/marts (regras de negócio)  → o "DBProDash" portado (Postgres local)
+E. Endpoints da API lendo local     → substitui o oraculum (14 contratos); KPIs → Neon on-demand
+F. Cutover e descomissionamento   → dgbcomex usa Neon (marts da API), DBProDash fora
 ```
 
 Regra transversal (manter sempre): **nunca** escrever no `DBMicrodata_DGB`; credenciais só em
-`.env` gitignored; schema `core`/`marts` do Neon = contrato (mudanças aditivas e versionadas);
-**o `public` do Neon é do app dgbcomex** (drizzle) — o api-microdata não altera nada lá e cria
-somente `raw`/`core`/`marts`/`etl`.
+`.env` gitignored; **Postgres local = warehouse completo** (raw/core/marts/etl); **Neon `dgbcomex`
+recebe apenas agregados pequenos de dashboard** (disparados pela API on-demand); o **`public` do
+Neon é do app dgbcomex** (drizzle) — não alterado pelo api-microdata, que mantém schemas próprios
+no Neon; mudanças de marts são aditivas e versionadas.
 
 ---
 
@@ -38,9 +39,10 @@ somente `raw`/`core`/`marts`/`etl`.
 | # | Decisão | Opções | Recomendação | Bloqueia |
 |---|---------|--------|--------------|----------|
 | D1 | **Neon**: criar projeto/database/branch | Branches por fase (dev/prod) | ✔ **resolvida**: Neon `dgbcomex` já criado e migrado (118 tabelas em `public`) | B,C |
-| D2 | **Credenciais** do Neon | `DATABASE_URL` no `.env` local (gitignored) | ✔ **resolvida**: `DATABASE_URL` (+ `DB_*` do ERP) no `app/.env` e no `dgbcomex/.env.local` | B |
-| D3 | **Runner do ETL** | VM on-prem (mesma rede do ERP) / máquina dev / CI | VM on-prem com cron; máquina dev para desenvolver | C |
-| D4 | **Frequência do ETL** | diária / horária / on-demand | diária fora do expediente; estoque de peças pode ter janela extra | C,D |
+| D2 | **Credenciais** do Neon | `DATABASE_URL` no `.env` local (gitignored) | ✔ **resolvida**: `DATABASE_URL` (Neon) + `DATABASE_URL_LOCAL` (Postgres local) no `app/.env` | B |
+| D2b | **Postgres local (warehouse)** | nativo / Docker / Neon | ✔ **resolvida**: PostgreSQL 17 **nativo** nesta máquina (`localhost:5432`), database `dgbcomex_warehouse` criado | B,C |
+| D3 | **Runner do ETL** | VM on-prem (mesma rede do ERP) / máquina dev / CI | máquina dev nesta fase (warehouse está aqui); VM separada quando for p/ produção | C |
+| D4 | **Frequência do ETL** | diária / horária / on-demand | **dupla**: ETL pesado diário no **Postgres local**; **sync de KPIs p/ Neon é on-demand** (no request, quando defasado) | C,D,E |
 | D5 | **Auth do alvo** | reusar tabela `usuario` (senha em **texto claro** — ruim) vs auth nova JWT+bcrypt | **auth nova** (JWT+bcrypt), escopos derivados de `Usuario_Acessos` | E |
 | D6 | **Multiempresa** | `Codigo_Empresas` (`char(2)`) imbutido por token vs header | empresa do token (padrão `SIS_UsuarioEmpresa`); suportar `?empresa=13` p/ dev | E |
 | D7 | **`/contas-pagas`** | reabrir como resumo vs lista vs manter `{}` | **resumo** `{ValorPago, QtdeBaixas}` do mês + lista paginada | E |
@@ -53,7 +55,8 @@ somente `raw`/`core`/`marts`/`etl`.
 
 ## 3. Fase B — Scaffold do projeto (`app/`)
 
-Objetivo: esqueleto executável com schemas no Neon (vazio) e convenções prontas.
+Objetivo: esqueleto executável com schemas criados no **Postgres local** (warehouse, vazio) e
+schemas próprios da API no Neon (marts pequenos) + convenções prontas.
 
 ### 3.1 Estrutura de código
 
@@ -62,22 +65,24 @@ app/
 ├─ pyproject.toml              # deps: fastapi, uvicorn, pydantic(-settings), pyodbc,
 │                              #       psycopg[binary], SQLAlchemy, alembic, reportlab,
 │                              #       bcrypt, PyJWT, python-dateutil, python-dotenv
-├─ alembic/                    # migrations do Neon — SOMENTE schemas raw/core/marts/etl
-│  └─ env.py                   # public NÃO é gerenciado aqui (é do app dgbcomex/drizzle)
-├─ .env                        # gitignored (DB_* do ERP + DATABASE_URL do Neon)
+├─ alembic/                    # migrations: schemas do Postgres local (raw/core/marts/etl)
+│  └─ env.py                   # + migrations dos schemas próprios no Neon (marts/etl da API)
+├─ .env                        # gitignored (DB_* do ERP + DATABASE_URL Neon + DATABASE_URL_LOCAL)
 ├─ src/
 │  ├─ config.py                # pydantic-settings; carrega .env
 │  ├─ db/
 │  │  ├─ erp.py                # pyodbc → DBMicrodata_DGB (somente leitura)
-│  │  └─ neon.py               # engine SQLAlchemy + pooling Neon (schemas raw/core/marts/etl)
-│  ├─ integracao/              # leitura de public (produto dgbcomex) via marts, sem DDL/DML ali
+│  │  └─ warehouse.py          # engine SQLAlchemy + pooling Postgres LOCAL
+│  │  └─ neon.py               # engine SQLAlchemy + pooling Neon (schemas próprios da API)
 │  ├─ etl/
-│  │  ├─ bootstrap.py          # carga full em ordem de dependência
+│  │  ├─ bootstrap.py          # carga full em ordem de dependência → Postgres local
 │  │  ├─ incremental.py        # por watermark / por documento-pai
 │  │  ├─ reconcile.py          # reconciliação (baixas/exclusões sem flag)
 │  │  ├─ extract/              # 1 módulo por domínio (faturamento, estoque, financeiro…)
 │  │  ├─ transform/            # trim de char, tipos, datas, timezone
-│  │  └─ load/                 # upsert no Neon (chave natural do ERP)
+│  │  └─ load/                 # upsert no Postgres local (chave natural do ERP)
+│  ├─ sync/                    # sync ON-DEMAND de KPIs/agregados pequenos → Neon
+│  │  └─ dashboards.py         # re-gera no Neon só os marts pequenos sob demanda
 │  └─ api/
 │     ├─ main.py               # FastAPI; CORS restrito; docs OpenAPI
 │     ├─ auth/                 # JWT + bcrypt + escopos (D5)
@@ -88,21 +93,29 @@ app/
 
 ### 3.2 Migrations iniciais (alembic)
 
+**Postgres local (`dgbcomex_warehouse`):**
+
 | Migration | Cria |
 |-----------|------|
 | `0001_etl` | schema `etl` + `etl.watermark` (tabela, coluna, ultimo_valor, ultima_exec, status, linhas, levou_s) + `etl.execucoes` + `etl.erros` |
 | `0002_raw` | schema `raw` + tabelas das fontes (espelho, `trim`), vazio |
 | `0003_core` | schema `core` + regras (faturamento, contas pagas, financeiro programado, estoque em aberto) |
-| `0004_marts` | schema `marts` + views de consumo (KPIs diários) |
+| `0004_marts` | schema `marts` + views de consumo (KPIs diários, estoque em aberto, sugestão de rolos) |
 
-Critério de aceite B: `alembic upgrade head` sobe os 4 schemas; `/health` responde no Neon; ETL
-consegue conectar no ERP (read-only).
+**Neon (schemas próprios da API, NÃO `public`):**
+
+| Migration | Cria |
+|-----------|------|
+| `1001_neon_marts` | schema `marts` (API) + `etl` (API) para os **agregados pequenos** de dashboard |
+
+Critério de aceite B: `alembic upgrade head` sobe os 4 schemas no **Postgres local** + schemas
+próprios no Neon (`public` intocado); `/health` responde lendo o local; ETL conecta no ERP (read-only).
 
 ---
 
-## 4. Fase C — ETL: bootstrap `raw` + incremental
+## 4. Fase C — ETL: bootstrap `raw` + incremental (**no Postgres local**)
 
-Objetivo: dados das fontes dos contratos no `raw` (sem regra), confiáveis e idempotentes.
+Objetivo: dados das fontes dos contratos no `raw` (sem regra) do **warehouse local**, confiáveis e idempotentes.
 
 ### 4.1 Tabelas-fonte por domínio (contratos da Doc 44)
 
@@ -135,14 +148,14 @@ Objetivo: dados das fontes dos contratos no `raw` (sem regra), confiáveis e ide
 - **Reconciliação** periódica (full leve) para baixas sem flag (`CTE_Baixa`, `Pag_Baixas`, `Rec_Baixas`).
 - Timezone **`America/Sao_Paulo`** na gravação; datas `date`/`timestamp`.
 
-Critério de aceite C: cada tabela do `raw` com contagem batendo com a do ERP (amostras) e
-`etl.watermark` avançando nas execuções posteriores.
+Critério de aceite C: cada tabela do `raw` (local) com contagem batendo com a do ERP (amostras) e
+`etl.watermark` (local) avançando nas execuções posteriores.
 
 ---
 
-## 5. Fase D — `core`/`marts` (regras portadas)
+## 5. Fase D — `core`/`marts` (regras portadas, **no Postgres local**)
 
-Objetivo: reproduzir no Neon o que o `DBProDash` faz hoje, validado número a número.
+Objetivo: reproduzir no Postgres local o que o `DBProDash` faz hoje, validado número a número.
 
 Portar as regras (da Doc 44 §2.2 e Estudos 12/29/30/31):
 
@@ -166,7 +179,9 @@ endpoints voltam a ser confiáveis.
 
 ## 6. Fase E — Endpoints da API (substitui o `oraculum`)
 
-Objetivo: os 14 contratos de negócio + health, lendo **apenas do Neon**, com auth.
+Objetivo: os 14 contratos de negócio + health, lendo **o warehouse Postgres local**, com auth.
+Nos endpoints de dashboard, a API **sincroniza no Neon** (schemas próprios) apenas o **agregado
+pequeno** correspondente, on-demand — nunca o volume bruto do ERP.
 
 | Grupo | Rotas |
 |-------|-------|
@@ -180,24 +195,32 @@ Entregáveis da fase:
 2. **Schemas Pydantic** idênticos em forma ao legado, porém tipados, `trim`, datas ISO.
 3. **Data de entrada**: aceita ISO; legacy `DDMMYYYY` em modo deprecado (log de aviso).
 4. **Erros padronizados**; CORS restrito às origens do `dgbcomex`.
-5. **PDF** (reportlab) servido do mart (404 quando não há material).
-6. **Teste de contrato**: script que bate KPI ONDE/legado × Neon e compara JSON (mesmo p/ `/dados`).
+5. **PDF** (reportlab) servido do `marts`**local** (404 quando não há material).
+6. **Sync on-demand p/ Neon** (D4): ao chamar um KPI de dashboard, re-sincroniza no Neon o mart
+   pequeno se o `etl.watermark` local estiver à frente da última publicação.
+7. **Teste de contrato**: script que bate KPI ONDE/legado × local e compara JSON (mesmo p/ `/dados`).
+
+> **Volume no Neon**: dashboard usa **agregados pequenos** (dezenas a centenas de linhas por mart,
+> não tabelas brutas). O que não é agregado explicável para dashboard **permanece só no Postgres
+> local** — ex.: `Cte_Peca`, `Fat_*`, `Pag_*` nunca sobem para o Neon.
 
 Critério de aceite E: contrato automático passando; latência de `/dashboard-completo` muito menor
-que a do legado (unica leitura, não 10 procs); auth bloqueando rota sem escopo.
+que a do legado (unica leitura, não 10 procs); auth bloqueando rota sem escopo; Neon enxuto
+(só agregados pequenos; `public` inalterado).
 
 ---
 
 ## 7. Fase F — Cutover e descomissionamento
 
-1. Apontar o `dgbcomex` (repo separado, Next.js/Vercel) para o **Neon** via `DATABASE_URL` (pooled);
-   congelar leitura do legado.
+1. Apontar o `dgbcomex` (repo separado, Next.js/Vercel) para os **marts da API no Neon** (KPIs de
+   dashboard); `public` continua sendo o schema do app (drizzle).
 2. Período de sombra: manter o legado no ar (read-only) 1–2 semanas comparando os mesmos KPIs.
 3. Desligar o `oraculum`; remover proc escreve/DBProDash do uso; **não** excluir `DBProDash`
    (pode haver consulta ocasional) — apenas deixar de ser fonte.
-4. Documentar contrato final + runbook de ETL (cron, reconciliação, monitor).
+4. Documentar contrato final + runbook de ETL (cron do Postgres local, sync on-demand, monitor).
 
-Critério de aceite F: `dgbcomex` operando só no Neon; legado desligado sem perda de tela.
+Critério de aceite F: `dgbcomex` operando com dashboards servidos do Neon (marts da API);
+warehouse local completo; legado desligado sem perda de tela.
 
 ---
 
@@ -205,30 +228,34 @@ Critério de aceite F: `dgbcomex` operando só no Neon; legado desligado sem per
 
 - [x] Neon `dgbcomex` criado e **`public` migrado** (118 tabelas) via `npm run db:migrate:all` no repo dgbcomex.
 - [x] Seed do dgbcomex executado no Neon (4 usuários demo + menus).
-- [ ] Confirmar **decisões D3–D4** (runner do ETL, frequência) — necessárias p/ começar a carga.
-- [ ] Criar `app/` com pyproject + venv + deps; `.env` com `DATABASE_URL`.
-- [ ] Alembic: migrations 0001–0004 (schemas vazios) e subir no Neon de dev.
+- [x] **Postgres local** nativo instalado (PG 17, `localhost:5432`) e database `dgbcomex_warehouse` criado.
+- [ ] Fase B: criar `app/` com pyproject + venv + deps; `.env` com `DATABASE_URL` (Neon) e `DATABASE_URL_LOCAL`.
+- [ ] Alembic: migrations 0001–0004 no **Postgres local** + schemas próprios no Neon (Fase B).
 - [ ] Módulo `db/erp.py` (conexão read-only) + prova de conceito de extract de 1 domínio (ex. `Fat_Pedido`).
-- [ ] Implementar ETL incremental + `etl.watermark`; bootstrap dos cadastros → faturamento → financeiro → estoque.
-- [ ] PORTAR regras `core`/`marts` e validar KPIs (Fase D).
-- [ ] Endpoints + auth + PDF (Fase E); testar contrato contra legado.
+- [ ] Implementar ETL incremental + `etl.watermark` (local); bootstrap dos cadastros → faturamento → financeiro → estoque.
+- [ ] PORTAR regras `core`/`marts` (local) e validar KPIs (Fase D).
+- [ ] Endpoints + auth + PDF (Fase E); **sync on-demand dos KPIs p/ Neon**; testar contrato contra legado.
 - [ ] Cutover (Fase F) e documentação final.
 
 ---
 
 ## 9. Riscos que vão ditar o ritmo
 
-- **Volume**: `Cte_Peca` (~317k) e itens de romaneio dominam a carga — agendar fora do expediente.
+- **Volume**: `Cte_Peca` (~317k) e itens de romaneio dominam a carga — **vão só para o Postgres
+  local** (agendar fora do expediente); o Neon nunca recebe esse volume.
 - **Watermarks ausentes**: tabelas sem coluna de data exigem recarga por pai (já previsto).
 - **Dependência de rede**: runner do ETL precisa alcançar `10.156.0.124` (ERP on-prem).
 - **Auth nova**: migrar usuários/escopos (do `Usuario_Acessos`) é trabalho próprio — iniciar cedo.
-- **Contrato do front**: mudanças em `core`/`marts` do Neon quebram o `dgbcomex` — aditivo e versionado.
-- **`public` compartilhado**: o Neon já tem dados do produto (118 tabelas em `public`); o
-  api-microdata só tem esquemas próprios e **nunca** altera `public` — integrações ficam em `marts`.
+- **Contrato do front**: mudanças em marts (locais e do Neon) quebram o `dgbcomex` — aditivo e versionado.
+- **`public` compartilhado**: o Neon já tem dados do produto (118 tabelas em `public`); a API só
+  tem schemas próprios no Neon e **nunca** altera `public` — integrações ficam nos marts.
 - **Bootstrap do Neon já feito** (setup): estrutura do `public` criada por `scripts/migrate.js`
   + `apply-drizzle-migrations.js` + seed (4 usuários demo) — nada disso é responsabilidade do
   api-microdata.
+- **Postgres local = novo ativo**: backup/recovery (pg_dump) e liberação de porta 5432 precisam
+  ser definidos; é o warehouse de verdade (fonte dos endpoints).
 
 ---
 
-_Estado: Fase A concluída. Próximo checkpoint: decisões D1–D8 → Fase B (scaffold `app/`)._
+_Estado: Fase A concluída. Infra pronta (Neon migrado + Postgres local 17 criado). Próximo
+checkpoint: Fase B (scaffold `app/`) — decisões D5–D8 pendentes de confirmação._

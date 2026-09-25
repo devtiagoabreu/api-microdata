@@ -1,10 +1,11 @@
-# Arquitetura alvo da nova API (legado `oraculum` → Neon)
+# Arquitetura alvo da nova API (legado `oraculum` → Postgres local + Neon)
 
-> **Data:** 19/set/2026
+> **Data:** 19/set/2026 (atualizado 25/set/2026)
 > **Escopo:** design da nova API Python que substitui a API legada `docs/legado/oraculum`,
 > partindo do recon dos 17 endpoints existentes e do plano de dados do [Estudo 22](../estudo/22-arquitetura-neon-etl.md).
-> **Restrições:** `DBMicrodata_DGB` é produção **somente leitura** (sem objetos novos); Neon é o
-> destino dos dados; o schema do Neon é **contrato** com o front `dgbcomex`.
+> **Restrições:** `DBMicrodata_DGB` é produção **somente leitura** (sem objetos novos); **Postgres
+> local** (`dgbcomex_warehouse`) é o **warehouse completo**; **Neon `dgbcomex` recebe só agregados
+> pequenos** (dashboards), e o `public` é **contrato** com o front `dgbcomex` (intocado).
 > **Relações:** Estudos 11–13 (superfície/views), 21–22 (BI/Neon), 28–31 (faturamento, receber, pagar), 34 (estoque de peças), 41 (usuários/segurança), 42 (infra/RLS).
 
 ---
@@ -42,21 +43,26 @@ FastAPI (Python 3.13, `uvicorn`, porta 58244) que **lê o SQL Server a cada requ
 
 ## 2. Arquitetura alvo
 
-`DBMicrodata_DGB (SQL Server, read-only) → ETL Python → Neon/PostgreSQL → dgbcomex`
-
 ```
-DBMicrodata_DGB (ERP, on-prem, somente leitura)
+DBMicrodata_DGB (SQL Server, on-prem, somente leitura)
         │  SELECT (watermark/identidade)
         ▼
-   Runner ETL (Python) ────────────►  Neon / PostgreSQL (externo)
+   Runner ETL (Python) ────────────►  Postgres LOCAL (warehouse, on-prem)
    (extract → raw → core → marts)        ├── raw   (espelho das fontes, sem regra)
         ▲                                ├── core  (regras portadas do DBProDash)
-        │                                ├── marts (views de consumo dgbcomex + API)
+        │                                ├── marts (views de consumo da API/locais)
         │                                └── etl   (watermark, execuções, auditoria)
         │
-   API Python (FastAPI, serve Neon)          │  leitura DIRETA (Prisma/Drizzle)
-   - endpoints compatíveis com oraculum      ▼
-   - PDF sugestão-rolos (servidor)    dgbcomex (Next.js + Vercel)
+   API Python (FastAPI, serve local)
+   - endpoints compatíveis com oraculum       │  sync ON-DEMAND de apenas
+   - PDF sugestão-rolos (servidor)            │  KPIs/agregados pequenos
+        │                                     ▼
+        │                    NEON dgbcomex (externo)
+        │                    ├── public (dados do app, drizzle) — INTOCADO
+        │                    └── marts (somente agregados pequenos p/ dashboards)
+        │                             │  leitura DIRETA (Prisma/Drizzle)
+        │                             ▼
+        │                        dgbcomex (Next.js + Vercel)
 
 DBProDash (on-prem) = PROTÓTIPO/referência de regra (deixa de ser lido em produção)
 ```
@@ -65,17 +71,26 @@ DBProDash (on-prem) = PROTÓTIPO/referência de regra (deixa de ser lido em prod
 
 | Componente | Papel |
 |------------|-------|
-| **ETL (Python)** | Extrai do ERP por watermark/identidade, transforma (trim de `char`, datas, tipos) e carrega `raw`; roda `core`/`marts`; grava auditoria em `etl.*`. Roda **próximo do ERP** (mesma rede on-prem, cron/agendador), pois o Neon não acessa `10.156.0.124`. |
-| **API (FastAPI)** | Lê **somente o Neon** (nunca o ERP), re-expondo os **contratos do legado** com tipagem (Pydantic), auth (JWT), multiempresa por token e geração de PDF. |
-| **`dgbcomex` (Next.js/Vercel)** | Camada de produto; lê Neon direto. Sem acesso ao ERP. |
+| **Postgres local** | **Warehouse principal.** Recebe todo o volume do ERP (raw/core/marts pesados e completos). Roda on-prem. É a fonte de verdade dos dados analíticos. |
+| **ETL (Python)** | Extrai do ERP por watermark/identidade, transforma (trim de `char`, datas, tipos) e carrega `raw`; roda `core`/`marts` no **Postgres local**; grava auditoria em `etl.*`. Roda **próximo do ERP** (mesma rede on-prem, cron/agendador), pois o Neon não acessa `10.156.0.124`. |
+| **API (FastAPI)** | Lê o **warehouse local** (Postgres) para servir os contratos do legado com tipagem (Pydantic), auth (JWT), multiempresa por token e geração de PDF. **Sincroniza apenas KPIs/agregados pequenos para o Neon on-demand** — nunca o volume bruto do ERP. |
+| **Neon `dgbcomex`** | Recebe **somente** cargas pequenas disparadas pela API (KPIs de dashboard). `public` (dados do app dgbcomex, drizzle) é intocado pela API. |
+| **`dgbcomex` (Next.js/Vercel)** | Camada de produto; lê Neon direto (dados do app + marts pequenos). Sem acesso ao ERP. |
 
 > Decisão central: **nenhum request de usuário toca o SQL Server.** O ERP só é lido pelo job
 > de ETL (janela/limite de conexões, fora do horário comercial para cargas grandes).
-> Exceção documentada: `sugestao-rolos` pode consultar o **mart de peças em aberto**
-> (refreshed incremental) ou, opcionalmente, ler o ERP on-demand via `SELECT` read-only
+> Exceção documentada: `sugestao-rolos` pode consultar o **mart de peças em aberto no warehouse
+> local** (refreshed incremental) ou, opcionalmente, ler o ERP on-demand via `SELECT` read-only
 > (lógica em Python, **nunca** `EXEC` de proc).
+>
+> **Regra de volume (Neon enxuto):** a base Neon `dgbcomex` não recebe o fluxo pesado da
+> `DBMicrodata_DGB`. Só sobem para o Neon **agregados pequenos** (KPIs diários/mensais,
+> totais por CFOP, resumos) produzidos pela API — dados de dashboard, não dados operacionais.
+> O trabalho pesado (espelho, core, marts completos, Cte_Peca etc.) vive **somente no Postgres local**.
 
 ### 2.2 Fluxo de dados
+
+**No Postgres local (warehouse on-prem):**
 
 1. **Bootstrap**: carga full por tabela em ordem de dependência (cadastros → cabeçalhos → itens → logs).
 2. **Incremental**: por coluna `watermark` (maior que o último valor persistido) ou, quando não houver,
@@ -83,49 +98,50 @@ DBProDash (on-prem) = PROTÓTIPO/referência de regra (deixa de ser lido em prod
 3. **Upsert** pela **chave natural do ERP** (após trim), nunca surrogate.
 4. **`etl.watermark`** registra por tabela: coluna, último valor, execução, status, linhas, duração.
 5. **Reconciliação** periódica (full leve) para baixas/exclusões sem flag (ex.: `CTE_Baixa`, `Pag_Baixas`).
-6. **Camada de produto `public`**: gerida pelo app dgbcomex (drizzle); o api-microdata **lê** quando
-   precisa (marts de integração) e **nunca escreve** ali.
 
-### 2.3 Modelo de schemas no Neon
+**No Neon (on-demand, disparado pela API):**
 
-O Neon é **um único banco** (`dgbcomex`) compartilhado entre o produto dgbcomex e a camada de dados:
+6. Quando um endpoint de dashboard é chamado, a API **verifica a defasagem** (via `etl.watermark` /
+   última atualização dos KPIs) e re-sincroniza no **Neon** apenas os **agregados pequenos**
+   necessários àquele dashboard (ex.: `marts.faturamento_diario`, `marts.devolucoes_diario`).
+7. O **schema `public`** do Neon (dados do app dgbcomex, drizzle) é **intocado**: a API nunca
+   escreve nele; os marts da API vivem em seus próprios schemas no Neon.
+
+### 2.3 Modelo de schemas
+
+**Postgres local** (`dgbcomex_warehouse`, on-prem) — warehouse completo:
+
+| Schema | Conteúdo | Quem lê |
+|--------|----------|---------|
+| `raw` | Espelho fiel das tabelas-fonte do ERP contratadas (colunas originais, `trim`), com colunas de rastreio | somente ETL |
+| `core` | Regras portadas das views do `DBProDash` (`vwFaturamento`, `vwContasPagas`, `vwFinanceiroContasReceber/Pagar`, custos) | marts + API |
+| `marts` | Views completas de consumo (KPIs diários, estoque em aberto, sugestão de rolos) | API (servir endpoints) |
+| `etl` | `watermark`, `execucoes`, `erros`, versionamento | somente ETL |
+
+**Neon `dgbcomex` (externo)** — enxuto:
 
 | Schema | Conteúdo | Quem lê | Dono |
 |--------|----------|---------|------|
-| `public` | **Dados do produto dgbcomex** (drizzle): `usuarios`, `clientes`, `produtos_cru`, `romaneios`, `romaneio_pecas`, CRM (`crm_pessoas`, `crm_visitas`, `crm_faturamentos`, `crm_pedidos_venda`…), `chamados`/`tickets`, `processos` (BPMN), `email_*`, `fornecedores`, `config_*` — ***não gerenciado pelo api-microdata*** | dgbcomex (Drizzle) | app dgbcomex |
-| `raw` | Espelho fiel das tabelas-fonte do ERP contratadas (colunas originais, `trim`), com colunas de rastreio | somente ETL | api-microdata |
-| `core` | Regras portadas das views do `DBProDash` (`vwFaturamento`, `vwContasPagas`, `vwFinanceiroContasReceber/Pagar`, custos) | marts + API | api-microdata |
-| `marts` | Views de consumo do `dgbcomex` e da API (KPIs diários, estoque em aberto) | dgbcomex + API | api-microdata |
-| `etl` | `watermark`, `execucoes`, `erros`, versionamento | somente ETL | api-microdata |
+| `public` | **Dados do produto dgbcomex** (drizzle): `usuarios`, `clientes`, `produtos_cru`, romaneios, CRM, chamados, BI… — **não gerenciado pela API** | dgbcomex (Drizzle) | app dgbcomex |
+| `marts` (API) | **Apenas agregados pequenos** produzidos on-demand pelos endpoints de dashboard (KPIs diários/mensais, resumos) — **sem volume bruto do ERP** | dgbcomex + API | api-microdata |
+| `etl` (API) | defasagem/status dos marts sincronizados | somente API | api-microdata |
 
-#### 2.3.1 Regra de coexistência com `public`
-
-O schema `public` contém **dados de negócio gerados pelo produto** (alguns já integrados com o
-ERP via coluna `id_integracao` e com `id` numérico do ERP no `codigo_pdm`). Para nunca colidir:
-
-- **O api-microdata só toca `raw`/`core`/`marts`/`etl`**; qualquer DDL/DML em `public` é do app.
-- **Join bidirecional** (dados do ERP ↔ dados do produto) é via `marts` que leem `raw` +
-  `public` (ex.: `marts.clientes_dgbcomex_erp` juntando `public.clientes` (CNPJ) com
-  `raw.clientes_principal`).
-- O **ETL nunca grava** em `public`; quando um dado do ERP não existe no produto (ou vice-versa),
-  o `marts` entrega com o lado ausente nulo — o app decide como materializar.
-- Mudanças em `raw`/`core`/`marts` são **aditivas e versionadas**; **nunca** `DROP`/`TRUNCATE`
-  em objeto que o `dgbcomex` lê, e **nenhum objeto de `public` é alterado pelo api-microdata**.
-
-Convenções (reaproveitando [Estudo 22 §7](../estudo/22-arquitetura-neon-etl.md)):
-- identificadores `snake_case` minúsculos; chaves = chave natural do ERP após `trim`.
-- datas em `date`/`timestamp`, valores em `numeric`, flags em `char(1)`/`text`.
-- timezone padrão **`America/Sao_Paulo`** na gravação.
-- **Somente `core`/`marts` são expostos**; `raw` e `etl` privados.
+> O `public` do Neon não é tocado pela API. `raw`/`core`/`marts` completos ficam **somente no
+> Postgres local**; para o Neon sobem exclusivamente os **agregados pequenos** que os dashboards
+> usam, e apenas quando disparados pela API (on-demand).
 
 ### 2.4 Camada de apresentação/API
 
-- FastAPI + Pydantic (**mesmo JSON shape** dos endpoints atuais, porém tipado e com data ISO).
+- FastAPI + Pydantic (**mesmo JSON shape** dos endpoints atuais, porém tipado e com data ISO),
+  lendo o **Postgres local** (warehouse).
+- **Sync on-demand p/ Neon**: nos endpoints de dashboard, a API publica no Neon (schemas de
+  marts/etl da própria API) apenas os **agregados pequenos** usados pela tela; o volume bruto
+  do ERP nunca vai para o Neon.
 - **Auth**: JWT com `bcrypt`; escopos derivados de `Usuario_Acessos` (Sistema×Topico —
   [Estudo 41](../estudo/41-usuarios-acessos-seguranca.md)); multiempresa por token
   (padrão `SIS_UsuarioEmpresa` ↔ `Empresas.Id_Empresa`, [Estudo 42 §7](../estudo/42-infra-topologia-infraestrutura.md)).
 - **Listagens grandes** (`/dados`): paginação por cursor.
-- **PDF** (`/pdf/sugestao-rolos`): continua server-side (reportlab ou weasyprint), agora lendo do mart.
+- **PDF** (`/pdf/sugestao-rolos`): continua server-side (reportlab ou weasyprint), agora lendo do `marts` local.
 - **CORS** restrito às origens reais do front (nunca `*` com credentials).
 - **`/test-procedure` e `/procedures`**: eliminados (exit do contrato).
 - **Observabilidade**: `etl.execucoes` + logs estruturados próprios; não reutilizar `Conn_*`/`mic_*`.
@@ -134,9 +150,9 @@ Convenções (reaproveitando [Estudo 22 §7](../estudo/22-arquitetura-neon-etl.m
 
 ## 3. Porte do legado para o Neon (referência rápida)
 
-| Legado (`DBProDash`) | Alvo (Neon) |
-|----------------------|-------------|
-| Proc por request (`uspFaturamento`, `uspDesconto`, …) | **Mart pré-computado** (`marts.faturamento_diario` etc.); API só `SELECT` |
+| Legado (`DBProDash`) | Alvo (Postgres local / Neon) |
+|----------------------|------------------------------|
+| Proc por request (`uspFaturamento`, `uspDesconto`, …) | **Mart pré-computado no Postgres local** (`marts.faturamento_diario` etc.); API só `SELECT`; KPI pequeno re-sincronizado no Neon on-demand |
 | `uspRel_CCusto_Niveis*` (`TRUNCATE+INSERT`) | Carga idempotente em `core`/`marts` (nunca `TRUNCATE` em produção de outro banco) |
 | `EOMONTH`/`CONVERT(...,103)` | Janelas em Python (`dateutil`) sobre coluna `date` |
 | `uspEnderecamentoParaAtenderPedidoGeral` (cursor + `FOR XML PATH`) | Reimplementação em Python/Postgres (janela `SUM(Metros) OVER`) |
@@ -151,20 +167,20 @@ SQL proprietário → padrões PostgreSQL: [checklist completo no Estudo 22 §6]
 ## 4. Riscos e decisões em aberto
 
 1. **Frequência do ETL do estoque de peças** (317k linhas): define se `sugestao-rolos` é
-   mart com refresh diário ou leitura on-demand do ERP. Recomendação: **mart + refresh
+   mart no **warehouse local** com refresh diário ou leitura on-demand do ERP. Recomendação: **mart + refresh
    em horário de baixo movimento**, reservando on-demand (read-only) como fallback.
-2. **Quando eliminar o `DBProDash`**: só após `core`/`marts` validados número a número
+2. **Quando eliminar o `DBProDash`**: só após `core`/`marts` locais validados número a número
    contra os valores atuais (contrato de regra).
-3. **Downtime/convergência**: o dgbcomex lê Neon direto; mudanças de `core`/`marts` são
-   **aditivas e versionadas** (alembic) com etapa de transição (criar coluna nova antes de dropar).
+3. **Downtime/convergência**: o dgbcomex lê Neon direto; mudanças de `core`/`marts` (locais e do
+   Neon) são **aditivas e versionadas** (alembic) com etapa de transição (criar coluna nova antes de dropar).
 4. **Runner ETL on-prem** precisa alcançar `10.156.0.124` (VPN/VM própria) — não roda na Vercel.
-5. **Segredos** (ERP e Neon) apenas em `.env` gitignored; a API autentica no ERP read-only
-   e no Neon como owner da camada própria.
-6. **Coexistência com `public`**: o Neon `dgbcomex` já tem o schema `public` do produto (118
-   tabelas, drizzle). O api-microdata deve respeitar esquemas próprios (`raw/core/marts/etl`) e
-   **nunca** alterar `public`; integrações de dados (ERP ↔ produto) são materializadas via `marts`.
-7. **Migrações aditivas**: `alembic` cria somente objetos novos nos schemas do api-microdata;
-   é proibido `DROP`/`ALTER` em objetos que o `dgbcomex` lê em `public`.
+5. **Segredos** (ERP, Postgres local e Neon) apenas em `.env` gitignored; a API autentica no ERP read-only
+   e nos dois Postgres como owner das próprias camadas.
+6. **Coexistência com `public`**: o Neon `dgbcomex` tem o schema `public` do produto (118
+   tabelas, drizzle). A API **nunca** altera `public`; escreve só em schemas próprios no Neon
+   (marts/etl de agregados) e mantém o volume bruto no Postgres local.
+7. **Migrações aditivas**: `alembic` cria somente objetos novos; é proibido `DROP`/`ALTER`
+   em objetos que o `dgbcomex` lê em `public`.
 
 ---
 
@@ -173,11 +189,11 @@ SQL proprietário → padrões PostgreSQL: [checklist completo no Estudo 22 §6]
 | Fase | Entrega | Saída |
 |------|---------|-------|
 | A (design) | Este doc + [contratos](./44-contratos-api-oraculum.md) | Contratos JSON e marts proposto |
-| B (scaffold) | Repo `app/`: FastAPI + ETL skeleton, `alembic`, schemas `raw/core/marts/etl` | Código da API |
-| C (carga) | Bootstrap full + incremental das tabelas-fonte dos contratos | `raw` populado |
-| D (marts) | Portar `vwFaturamento`/`vwContasPagas`/`vwFinanceiro*`/custos + estoque em aberto → `core`/`marts` | Números batendo com o on-prem |
-| E (endpoints) | Re-expor os 14 contratos de negócio lendo Neon + PDF; auth; paginação | API substituta |
-| F (cutover) | Ponto o dgbcomex para o Neon; desliga legado | Descomissionar `DBProDash` |
+| B (scaffold) | Repo `app/`: FastAPI + ETL skeleton, `alembic`, schemas `raw/core/marts/etl` no **Postgres local** + schemas de marts no Neon | Código da API |
+| C (carga) | Bootstrap full + incremental das tabelas-fonte dos contratos → **Postgres local** | `raw` populado |
+| D (marts) | Portar `vwFaturamento`/`vwContasPagas`/`vwFinanceiro*`/custos + estoque em aberto → `core`/`marts` locais | Números batendo com o on-prem |
+| E (endpoints) | Re-expor os 14 contratos de negócio lendo o **warehouse local** + PDF; auth; paginação; **sync on-demand dos KPIs p/ Neon** | API substituta |
+| F (cutover) | Ponto o dgbcomex para o Neon (marts da API); desliga legado | Descomissionar `DBProDash` |
 
 ---
 

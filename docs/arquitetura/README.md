@@ -5,7 +5,7 @@ alinhados ao plano de dados do [Estudo 22](../estudo/22-arquitetura-neon-etl.md)
 
 | # | Documento | Conteúdo | Status |
 |---|-----------|----------|--------|
-| 43 | [Arquitetura alvo da nova API](./43-arquitetura-alvo-api.md) | Legado `oraculum` → Neon (`raw`/`core`/`marts`/`etl`), ETL incremental, API lendo Neon, roadmap | ✔ |
+| 43 | [Arquitetura alvo da nova API](./43-arquitetura-alvo-api.md) | Legado `oraculum` → **Postgres local** (warehouse `raw`/`core`/`marts`/`etl`) + **Neon enxuto** (só agregados pequenos de dashboard; `public` do app intocado), ETL incremental, sync on-demand via API | ✔ |
 | 44 | [Contratos da API](./44-contratos-api-oraculum.md) | 17 rotas do legado mapeadas → fonte ERP → mart Neon → contrato JSON | ✔ |
 | 45 | [Plano de implementação](./45-plano-de-implementacao.md) | Tudo a fazer (fases B–F), decisões pendentes (D1–D8), estrutura do `app/`, ordem de execução, critérios de aceite | ✔ |
 
