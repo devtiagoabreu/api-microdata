@@ -57,14 +57,8 @@ class TestJanelasDeData:
     def test_mes_seguinte_vira_ano(self):
         assert kpis._proximo_mes(date(2026, 12, 15)) == date(2027, 1, 1)
 
-    def test_mes_anterior_vira_ano(self):
-        assert kpis._mes_anterior(date(2026, 1, 1)) == date(2025, 12, 1)
-
     def test_primeiro_dia_sobra_a_data(self):
         assert kpis._primeiro_dia(date(2026, 3, 15)) == date(2026, 3, 1)
-
-    def test_doze_mes_atras_da_janela_do_anual(self):
-        assert kpis._mes_anterior_doze(date(2026, 10, 1)) == date(2025, 10, 1)
 
 
 class TestPdfSugestaoDeRolos:

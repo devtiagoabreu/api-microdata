@@ -24,6 +24,7 @@ PROCEDURES_SOMENTE_LEITURA = frozenset(
         "uspDashFinanceiroContasReceberProgramado",
         "uspCustoAdmArmFat",
         "uspCustoAdmArmFatMensal",
+        "uspcustoadmcomparativo",
         "uspDesconto",
         "uspDevolucao",
         "uspEnderecamentoParaAtenderPedidoGeral",

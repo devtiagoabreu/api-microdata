@@ -2,13 +2,16 @@
 
 Cada rota lê um mart do warehouse local em vez de executar uma `usp` do `DBProDash`: o legado
 fazia até 10 `EXEC` por request (`/dashboard-completo`), aqui a leitura é uma query por KPI sobre
-`marts`. As chaves do JSON e as regras de janela continuam as do legado — inclusive as duas
-escolhas que parecem erro e não são (ver Doc 44):
+`marts` — exceto os custos, que consultam `uspCustoAdmComparativo` no `DBProDash` (a procedure
+agrega o rateio **ao vivo** de `sp_PagRel_CCusto_Niveis`, corrigindo o `Rel_CCusto_Niveis` que o
+ETL espelha congelado; ver Doc 44 #7/#8). As chaves do JSON e as regras de janela continuam as do
+legado, inclusive as escolhas que parecem erro e não são (ver Doc 44):
 
 - a "janela de programmed" (`Vencimento >= 1º dia do mês corrente`, <= 2050-12-31) era aplicada
   pelas procedures, não pelas views, então ela mora aqui — e o mês de corte é o **corrente**,
   não o seguinte (medido contra `uspDashFinanceiroContas*Programado`);
-- o "anual" de custos divide o faturamento por 12 (média mensal) e devolve `Armazenagem = 0`.
+- o "anual" de custos divide o faturamento por 12 (média mensal) e devolve `Armazenagem = 0`; o
+  "mensal" agora é o **mês atual** (grande) + `MesAnterior` (pequeno), sem o acúmulo histórico.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from src.api.auth.escopos import (
     exigir_escopo,
 )
 from src.api.auth.usuarios import Usuario
-from src.db import warehouse
+from src.db import erp, warehouse
 from src.etl import publicar
 
 router = APIRouter(tags=["kpis"])
@@ -52,11 +55,6 @@ def _primeiro_dia(valor: date) -> date:
 def _proximo_mes(valor: date) -> date:
     inicio = _primeiro_dia(valor)
     return date(inicio.year + (inicio.month == 12), inicio.month % 12 + 1, 1)
-
-
-def _mes_anterior(valor: date) -> date:
-    inicio = _primeiro_dia(valor)
-    return date(inicio.year - (inicio.month == 1), inicio.month - 1 or 12, 1)
 
 
 def _soma(sql: str, params: dict[str, Any] | None = None) -> float:
@@ -195,52 +193,44 @@ def _programado(origem: str, *, distinct: bool) -> dict[str, Any]:
 
 
 def _custos(referencia: date, anual: bool) -> dict[str, Any]:
-    """`uspCustoAdmArmFat` / `uspCustoAdmArmFatMensal`, medidos contra as procedures.
+    """`uspCustoAdmComparativo` no DBProDash: costos por janela com o dados vivos.
 
-    As duas procedures são inconsistentes entre si e o replicamos como está (Doc 44 #7/#8):
+    A procedure nova agrega `Faturamento` (vwFaturamento) e `Administrativo` (baixas dos
+    departamentos `1.1.1.1`/`1.1.1.2` do rateio ao vivo) para: mês atual, mês anterior,
+    12 meses fechados, ano atual e ano anterior. Corrige o quirk do legado, onde o
+    `Administrativo` somava o histórico inteiro (`Porc_Administrativo` de 1758% no mensal).
 
-    - `Faturamento` anual = Σ dos **12 meses fechados** (mês corrente − 12 .. − 1) ÷ 12;
-      o mensal é o faturamento do **último mês fechado**, sem dividir;
-    - `Administrativo` = acumulado **histórico** inteiro de `1.1.1.1`/`1.1.1.2`; a anual
-      ainda divide por 12, a mensal não divide — daí `Porc_Administrativo` de 1758% no mensal;
-    - `Armazenagem` e `Porc_Armazenagem` são sempre 0 (não havia cálculo de armazenagem).
+    - mensal = **mês atual** (card grande) + `MesAnterior` (card pequeno);
+    - anual = Σ dos **12 meses fechados** ÷ 12 (média mensal, como no legado).
     """
-    primeiro = _primeiro_dia(referencia)
+    linhas = erp.query("exec DBProDash.dbo.uspCustoAdmComparativo ?", (referencia,))
+    janelas = {linha["janela"]: linha for linha in linhas}
+
+    def _recorte(janela: str, divisor: int) -> dict[str, Any]:
+        faturamento = float(janelas[janela]["Faturamento"] or 0) / divisor
+        administrativo = float(janelas[janela]["Administrativo"] or 0) / divisor
+        return {
+            "Faturamento": faturamento,
+            "Administrativo": administrativo,
+            "Armazenagem": 0.0,
+            "Porc_Administrativo": (
+                administrativo / faturamento if faturamento else 0.0
+            ),
+            "Porc_Armazenagem": 0.0,
+        }
+
     if anual:
-        janela = {"inicio": _mes_anterior_doze(primeiro), "fim": primeiro}
-        divisor = 12
-    else:
-        janela = {"inicio": _mes_anterior(primeiro), "fim": primeiro}
-        divisor = 1
-    faturamento = _soma(
-        "select sum(faturamento) from marts.faturamento_diario "
-        "where data >= :inicio and data < :fim",
-        janela,
-    ) / divisor
-    administrativo = _soma(
-        "select sum(valor_baixado) from marts.custos_administrativo_mensal"
-    ) / divisor
-    return {
-        "Faturamento": faturamento,
-        "Administrativo": administrativo,
-        "Armazenagem": 0.0,
-        "Porc_Administrativo": (administrativo / faturamento) if faturamento else 0.0,
-        "Porc_Armazenagem": 0.0,
-    }
-
-
-def _mes_anterior_doze(valor: date) -> date:
-    inicio = _primeiro_dia(valor)
-    for _ in range(12):
-        inicio = _mes_anterior(inicio)
-    return inicio
+        return _recorte("ultimos_12_meses", 12)
+    atual = _recorte("mes_atual", 1)
+    atual["MesAnterior"] = _recorte("mes_anterior", 1)
+    return atual
 
 
 @router.get("/custos-administrativos-anual")
 def custos_administrativos_anual(usuario: _financeiro, data: date | None = None) -> dict[str, Any]:
-    """`uspRel_CCusto_NiveisAnual` + `uspCustoAdmArmFat`: 12 meses fechados, tudo ÷ 12.
+    """`uspCustoAdmComparativo`: Σ dos 12 meses fechados ÷ 12 (média mensal).
 
-    `data` (opcional, padrão hoje) só ancora a janela; a procedure original não recebe data.
+    `data` (opcional, padrão hoje) ancora a janela na procedure.
     """
     return _custos(data or date.today(), anual=True)
 
@@ -249,9 +239,9 @@ def custos_administrativos_anual(usuario: _financeiro, data: date | None = None)
 def custos_administrativos_mensal(
     usuario: _financeiro, data: date | None = None
 ) -> dict[str, Any]:
-    """`uspRel_CCusto_NiveisMensal` + `uspCustoAdmArmFatMensal`: último mês fechado.
+    """`uspCustoAdmComparativo`: **mês atual** + `MesAnterior` (dados vivos do rateio).
 
-    `data` (opcional, padrão hoje) só ancora a janela; a procedure original não recebe data.
+    `data` (opcional, padrão hoje) ancora a janela na procedure.
     """
     return _custos(data or date.today(), anual=False)
 

@@ -131,18 +131,41 @@ def validar_programados(cliente: TestClient) -> Relatorio:
 
 
 def validar_custos(cliente: TestClient) -> Relatorio:
-    """Custos administrativos: uspRel_CCusto_Niveis* + uspCustoAdmArmFat*."""
-    print("\n== custos administrativos (uspCustoAdmArmFat) ==")
+    """Custos administrativos: uspCustoAdmComparativo (rateio vivo) x recortes da API.
+
+    A API não replica mais o quirk do legado (acúmulo histórico): consulta a procedure nova,
+    que devolve as janelas (mês atual, mês anterior, 12m, ano atual, ano anterior). Conferimos
+    que a API entrega o recorte certo para cada rota:
+    - mensal → mês atual (grande) + `MesAnterior` (pequeno);
+    - anual → Σ dos 12 meses fechados ÷ 12 (média mensal, como o legado).
+    """
+    print("\n== custos administrativos (uspCustoAdmComparativo) ==")
     rel = Relatorio()
-    for rota, proc in (
-        ("/custos-administrativos-mensal", "uspCustoAdmArmFatMensal"),
-        ("/custos-administrativos-anual", "uspCustoAdmArmFat"),
-    ):
-        legado = _primeira(proc)
-        obtido = cliente.get(rota)
-        obtido.raise_for_status()
-        for coluna in ("Faturamento", "Administrativo", "Armazenagem"):
-            rel.conferir(f"{proc}.{coluna}", obtido.json()[coluna], _linha_legada(legado, coluna))
+    janelas = {linha["janela"]: linha for linha in _linhas("uspCustoAdmComparativo")}
+
+    mensal = cliente.get("/custos-administrativos-mensal")
+    mensal.raise_for_status()
+    corpo = mensal.json()
+    atual, anterior = janelas["mes_atual"], janelas["mes_anterior"]
+    for chave in ("Faturamento", "Administrativo"):
+        rel.conferir(f"mensal.{chave}", corpo[chave], _linha_legada(atual, chave))
+    for chave in ("Faturamento", "Administrativo"):
+        rel.conferir(
+            f"mensal.MesAnterior.{chave}",
+            corpo["MesAnterior"][chave],
+            _linha_legada(anterior, chave),
+        )
+
+    anual = cliente.get("/custos-administrativos-anual")
+    anual.raise_for_status()
+    corpo = anual.json()
+    doze = janelas["ultimos_12_meses"]
+    for chave in ("Faturamento", "Administrativo"):
+        rel.conferir(
+            f"anual.{chave}",
+            corpo[chave],
+            _dec(_linha_legada(doze, chave)) / 12,
+        )
     return rel
 
 
