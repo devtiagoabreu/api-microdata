@@ -74,6 +74,12 @@ class TestContratoComparativo:
         for janela in corpo.values():
             assert set(janela) == {"ContasPagas"}
 
+    def test_faturamento_tem_quatro_janelas(self):
+        corpo = client.get("/faturamento/2026-03-15").json()
+        assert set(corpo) == {"MesAtual", "MesAnterior", "AnoAtual", "AnoAnterior"}
+        for janela in corpo.values():
+            assert set(janela) == {"Faturamento"}
+
     def test_descontos_tem_quatro_janelas(self):
         corpo = client.get("/descontos/2026-03-15").json()
         assert set(corpo) == {"MesAtual", "MesAnterior", "AnoAtual", "AnoAnterior"}

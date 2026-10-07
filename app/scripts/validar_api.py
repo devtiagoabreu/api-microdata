@@ -94,13 +94,23 @@ def _soma_mart(mart: str, coluna: str, inicio: date, fim: date) -> Decimal:
     return Decimal(str(valor or 0))
 
 
+def _soma_vw(inicio: date, fim: date) -> Decimal:
+    """Σ(Vr_Total)+Σ(Acres_Desc) do `vwFaturamento` ao vivo — fonte real do `/faturamento`."""
+    linha = erp.query(
+        "select coalesce(sum(Vr_Total), 0) + coalesce(sum(Acres_Desc), 0) as faturamento "
+        "from DBProDash.dbo.vwFaturamento where Data_Nota >= ? and Data_Nota < ?",
+        (inicio, fim),
+    )[0]
+    return _dec(linha["faturamento"])
+
+
 def validar_simples(cliente: TestClient) -> Relatorio:
-    """Rotas de valor: faturamento/dia seguem `{Campo: number}`; as mensais agora levam o
-    comparativo (MesAtual/MesAnterior/AnoAtual/AnoAnterior) — Doc 44 #6/#9/#10/#11."""
+    """Rotas de valor: faturamento-dia segue `{Campo: number}`; as mensais levam o comparativo
+    (MesAtual/MesAnterior/AnoAtual/AnoAnterior) — Doc 44 #4/#6/#9/#10/#11. O `/faturamento` lê o
+    `vwFaturamento` ao vivo, então as janelas de ano conferem contra a mesma vista (não o mart)."""
     print("\n== KPIs de valor (uspFaturamento/Dia/Desconto/Devolucao/Estorno/BaixasPagar) ==")
     rel = Relatorio()
     simples = (
-        ("/faturamento/{data}", "uspFaturamento", "Faturamento"),
         ("/faturamento-dia/{data}", "uspFaturamentoDia", "Faturamento"),
     )
     comparativos = (
@@ -121,7 +131,7 @@ def validar_simples(cliente: TestClient) -> Relatorio:
             obtido = cliente.get(rota.format(data=dia.isoformat()))
             obtido.raise_for_status()
             rel.conferir(f"{proc} {dia:%Y-%m}", obtido.json().get(coluna), esperado)
-        for rota, proc, coluna, mart, coluna_mart in comparativos:
+        for rota, proc, coluna, fonte, coluna_fonte in comparativos:
             obtido = cliente.get(rota.format(data=dia.isoformat()))
             obtido.raise_for_status()
             corpo = obtido.json()
@@ -139,13 +149,38 @@ def validar_simples(cliente: TestClient) -> Relatorio:
             rel.conferir(
                 f"{proc} {dia:%Y-%m} AnoAtual",
                 corpo["AnoAtual"][coluna],
-                _soma_mart(mart, coluna_mart, date(dia.year, 1, 1), kpis._proximo_mes(dia)),
+                _soma_mart(fonte, coluna_fonte, date(dia.year, 1, 1), kpis._proximo_mes(dia)),
             )
             rel.conferir(
                 f"{proc} {dia:%Y-%m} AnoAnterior",
                 corpo["AnoAnterior"][coluna],
-                _soma_mart(mart, coluna_mart, date(dia.year - 1, 1, 1), date(dia.year, 1, 1)),
+                _soma_mart(fonte, coluna_fonte, date(dia.year - 1, 1, 1), date(dia.year, 1, 1)),
             )
+        rota, proc, coluna = "/faturamento/{data}", "uspFaturamento", "Faturamento"
+        obtido = cliente.get(rota.format(data=dia.isoformat()))
+        obtido.raise_for_status()
+        corpo = obtido.json()
+        rel.conferir(
+            f"{proc} {dia:%Y-%m} MesAtual",
+            corpo["MesAtual"][coluna],
+            _linha_legada(_primeira(proc, (_ddmmyyyy(dia),)), coluna),
+        )
+        anterior = kpis._mes_anterior(dia)
+        rel.conferir(
+            f"{proc} {dia:%Y-%m} MesAnterior",
+            corpo["MesAnterior"][coluna],
+            _linha_legada(_primeira(proc, (_ddmmyyyy(anterior),)), coluna),
+        )
+        rel.conferir(
+            f"{proc} {dia:%Y-%m} AnoAtual",
+            corpo["AnoAtual"][coluna],
+            _soma_vw(date(dia.year, 1, 1), kpis._proximo_mes(dia)),
+        )
+        rel.conferir(
+            f"{proc} {dia:%Y-%m} AnoAnterior",
+            corpo["AnoAnterior"][coluna],
+            _soma_vw(date(dia.year - 1, 1, 1), date(dia.year, 1, 1)),
+        )
     return rel
 
 
@@ -351,7 +386,7 @@ def validar_dashboard(cliente: TestClient, dia: date = date(2026, 3, 1)) -> Rela
     rel = Relatorio()
     completo = cliente.get(f"/dashboard-completo/{dia.isoformat()}").json()
     for chave, rota, *caminho in (
-        ("faturamento", "/faturamento/{data}", "Faturamento"),
+        ("faturamento", "/faturamento/{data}", "MesAtual", "Faturamento"),
         ("faturamento_dia", "/faturamento-dia/{data}", "Faturamento"),
         ("contas_pagas", "/contas-pagas/{data}", "MesAtual", "ContasPagas"),
         ("descontos", "/descontos/{data}", "MesAtual", "Desconto"),

@@ -4,15 +4,19 @@ Cada rota lê um mart do warehouse local em vez de executar uma `usp` do `DBProD
 fazia até 10 `EXEC` por request (`/dashboard-completo`), aqui a leitura é uma query por KPI sobre
 `marts` — exceto os custos, que consultam `uspCustoAdmComparativo` no `DBProDash` (a procedure
 agrega o rateio **ao vivo** de `sp_PagRel_CCusto_Niveis`, corrigindo o `Rel_CCusto_Niveis` que o
-ETL espelha congelado; ver Doc 44 #7/#8). As chaves do JSON e as regras de janela continuam as do
-legado, inclusive as escolhas que parecem erro e não são (ver Doc 44):
+ETL espelha congelado; ver Doc 44 #7/#8), e o `/faturamento`, que lê o `vwFaturamento` ao vivo
+para o mês atual bater sempre com o card de custos (o mart pode estar atrasado). As chaves do JSON
+e as regras de janela continuam as do legado, inclusive as escolhas que parecem erro e não são
+(ver Doc 44):
 
 - a "janela de programmed" (`Vencimento >= 1º dia do mês corrente`, <= 2050-12-31) era aplicada
   pelas procedures, não pelas views, então ela mora aqui — e o mês de corte é o **corrente**,
   não o seguinte (medido contra `uspDashFinanceiroContas*Programado`);
-- as rotas mensais de valor (`/contas-pagas`, `/descontos`, `/devolucoes`, `/estornos`) devolvem
-  um **comparativo** com 4 janelas (`MesAtual`, `MesAnterior`, `AnoAtual`, `AnoAnterior`) para o
-  card do BI — `AnoAtual` acumula de 1º/jan até o fim do mês de `data`;
+- as rotas mensais de valor (`/faturamento`, `/contas-pagas`, `/descontos`, `/devolucoes`,
+  `/estornos`) devolvem um **comparativo** com 4 janelas (`MesAtual`, `MesAnterior`, `AnoAtual`,
+  `AnoAnterior`) para o card do BI — `AnoAtual` acumula de 1º/jan até o fim do mês de `data`;
+  o `/faturamento` lê o `vwFaturamento` **ao vivo** (mesma fonte do custos), porque o mart
+  `faturamento_diario` pode estar atrasado e divergir do card de custos;
 - o "anual" de custos devolve `Faturamento`/`Administrativo` com `Total` (Σ 12 meses fechados) e
   `Media` (÷12), e `Armazenagem`/`Porc_Armazenagem` saíram do contrato (sempre 0 no legado); o
   "mensal" é o **mês atual** (grande) + `MesAnterior` (pequeno), sem o acúmulo histórico.
@@ -80,38 +84,57 @@ def _somatorio(mart: str, coluna: str, inicio: date, fim: date) -> float:
     )
 
 
-def _comparativo(data: date, mart: str, coluna: str, rotulo: str) -> dict[str, dict[str, float]]:
-    """4 janelas para as rotas mensais de valor (Doc 44 #6/#9/#10/#11).
+def _janelas_4(data: date) -> tuple[tuple[str, date, date], ...]:
+    """As 4 janelas comparativas das rotas mensais (Doc 44 #6/#9/#10/#11).
 
     `MesAtual` e `MesAnterior` espelham a janela da `usp` legada (mês de `data`); `AnoAtual`
     acumula de 1º/jan do ano de `data` até o fim desse mês; `AnoAnterior` é o ano inteiro.
     """
     inicio_mes = _primeiro_dia(data)
-    janelas = (
+    return (
         ("MesAtual", inicio_mes, _proximo_mes(inicio_mes)),
         ("MesAnterior", _mes_anterior(inicio_mes), inicio_mes),
         ("AnoAtual", date(data.year, 1, 1), _proximo_mes(inicio_mes)),
         ("AnoAnterior", date(data.year - 1, 1, 1), date(data.year, 1, 1)),
     )
+
+
+def _comparativo(data: date, mart: str, coluna: str, rotulo: str) -> dict[str, dict[str, float]]:
+    """4 janelas de valor lidas de um mart do warehouse (Doc 44 #6/#9/#10/#11)."""
     return {
         nome: {rotulo: _somatorio(mart, coluna, inicio, fim)}
-        for nome, inicio, fim in janelas
+        for nome, inicio, fim in _janelas_4(data)
     }
 
 
 # ---------------------------------------------------------------- faturamento
 
 
+def _faturamento_vivo(inicio: date, fim: date) -> float:
+    """Σ(Vr_Total)+Σ(Acres_Desc) de `vwFaturamento` em [inicio, fim), a fonte viva do legado.
+
+    O mart `faturamento_diario` espelha essas duas colunas, mas o ETL pode estar atrasado (ex.:
+    sem o dia de ontem), fazendo o card divergir dos custos. Aqui lemos o mesmo `vwFaturamento`
+    do `uspCustoAdmComparativo`, então mês atual/anterior batem sempre com o card de custos.
+    """
+    linhas = erp.query(
+        "select coalesce(sum(Vr_Total), 0) + coalesce(sum(Acres_Desc), 0) as faturamento "
+        "from DBProDash.dbo.vwFaturamento where Data_Nota >= ? and Data_Nota < ?",
+        (inicio, fim),
+    )
+    return float(linhas[0]["faturamento"] or 0)
+
+
 @router.get("/faturamento/{data}")
-def faturamento(data: date, usuario: _faturamento) -> dict[str, float]:
-    """`uspFaturamento`: Σ(Vr_Total) + Σ(Acres_Desc) do **mês** de `data`."""
-    inicio = _primeiro_dia(data)
+def faturamento(data: date, usuario: _faturamento) -> dict[str, Any]:
+    """`uspFaturamento`: Σ(Vr_Total)+Σ(Acres_Desc) do mês de `data` + comparativo 4 janelas.
+
+    Lê o `vwFaturamento` **ao vivo** (mesma fonte dos custos) em vez do mart, para o card
+    "Faturamento" do BI mostrar o mesmo mês atual que o custos-administrativos-mensal.
+    """
     return {
-        "Faturamento": _soma(
-            "select sum(faturamento) from marts.faturamento_diario "
-            "where data >= :inicio and data < :fim",
-            {"inicio": inicio, "fim": _proximo_mes(inicio)},
-        )
+        nome: {"Faturamento": _faturamento_vivo(inicio, fim)}
+        for nome, inicio, fim in _janelas_4(data)
     }
 
 
