@@ -60,6 +60,40 @@ class TestJanelasDeData:
     def test_primeiro_dia_sobra_a_data(self):
         assert kpis._primeiro_dia(date(2026, 3, 15)) == date(2026, 3, 1)
 
+    def test_mes_anterior_atravessa_ano(self):
+        assert kpis._mes_anterior(date(2026, 1, 15)) == date(2025, 12, 1)
+        assert kpis._mes_anterior(date(2026, 6, 1)) == date(2026, 5, 1)
+
+
+class TestContratoComparativo:
+    """Rotas mensais de valor levam 4 janelas; custos sem Armazenagem e com Total+Media."""
+
+    def test_contas_pagas_tem_quatro_janelas(self):
+        corpo = client.get("/contas-pagas/2026-03-15").json()
+        assert set(corpo) == {"MesAtual", "MesAnterior", "AnoAtual", "AnoAnterior"}
+        for janela in corpo.values():
+            assert set(janela) == {"ContasPagas"}
+
+    def test_descontos_tem_quatro_janelas(self):
+        corpo = client.get("/descontos/2026-03-15").json()
+        assert set(corpo) == {"MesAtual", "MesAnterior", "AnoAtual", "AnoAnterior"}
+        assert set(corpo["MesAtual"]) == {"Desconto"}
+
+    def test_custos_anual_tem_total_e_media(self):
+        corpo = client.get("/custos-administrativos-anual").json()
+        assert set(corpo) == {"Faturamento", "Administrativo", "Porc_Administrativo"}
+        assert set(corpo["Faturamento"]) == {"Total", "Media"}
+        assert abs(corpo["Faturamento"]["Media"] * 12 - corpo["Faturamento"]["Total"]) < 0.01
+
+    def test_custos_mensal_sem_armazenagem(self):
+        corpo = client.get("/custos-administrativos-mensal").json()
+        assert "Armazenagem" not in corpo and "Porc_Armazenagem" not in corpo
+        assert set(corpo["MesAnterior"]) == {
+            "Faturamento",
+            "Administrativo",
+            "Porc_Administrativo",
+        }
+
 
 class TestPdfSugestaoDeRolos:
     """Contrato #3: mesmo cartao do legado, sem arquivo temporario em disco."""

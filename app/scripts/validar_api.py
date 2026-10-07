@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient  # noqa: E402  (precisa do env acima)
 from sqlalchemy import text  # noqa: E402
 
 from src.api.main import app  # noqa: E402
+from src.api.routers import kpis  # noqa: E402
 from src.db import erp, warehouse  # noqa: E402
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -80,24 +81,71 @@ def _ddmmyyyy(valor: date) -> str:
     return valor.strftime("%d/%m/%Y")
 
 
+def _soma_mart(mart: str, coluna: str, inicio: date, fim: date) -> Decimal:
+    """Σ no mart do warehouse para a janela [inicio, fim) — sanidade das janelas de ano."""
+    with warehouse.engine().connect() as conn:
+        valor = conn.execute(
+            text(
+                f"select coalesce(sum({coluna}), 0) from {mart} "
+                "where data >= :inicio and data < :fim"
+            ),
+            {"inicio": inicio, "fim": fim},
+        ).scalar()
+    return Decimal(str(valor or 0))
+
+
 def validar_simples(cliente: TestClient) -> Relatorio:
-    """Rotas de um único valor mensal/diario x usp de mesmo nome."""
+    """Rotas de valor: faturamento/dia seguem `{Campo: number}`; as mensais agora levam o
+    comparativo (MesAtual/MesAnterior/AnoAtual/AnoAnterior) — Doc 44 #6/#9/#10/#11."""
     print("\n== KPIs de valor (uspFaturamento/Dia/Desconto/Devolucao/Estorno/BaixasPagar) ==")
     rel = Relatorio()
-    alvos = (
+    simples = (
         ("/faturamento/{data}", "uspFaturamento", "Faturamento"),
         ("/faturamento-dia/{data}", "uspFaturamentoDia", "Faturamento"),
-        ("/descontos/{data}", "uspDesconto", "Desconto"),
-        ("/devolucoes/{data}", "uspDevolucao", "Devolucao"),
-        ("/estornos/{data}", "uspEstorno", "Estorno"),
-        ("/contas-pagas/{data}", "uspListagemBaixasPagar", "ContasPagas"),
+    )
+    comparativos = (
+        ("/descontos/{data}", "uspDesconto", "Desconto", "marts.faturamento_diario", "desconto"),
+        ("/devolucoes/{data}", "uspDevolucao", "Devolucao", "marts.devolucoes_diario", "valor"),
+        ("/estornos/{data}", "uspEstorno", "Estorno", "marts.estornos_diario", "valor_nota"),
+        (
+            "/contas-pagas/{data}",
+            "uspListagemBaixasPagar",
+            "ContasPagas",
+            "marts.contas_pagas_diario",
+            "valor_pago",
+        ),
     )
     for dia in MESES_DE_TESTE:
-        for rota, proc, coluna in alvos:
+        for rota, proc, coluna in simples:
             esperado = _linha_legada(_primeira(proc, (_ddmmyyyy(dia),)), coluna)
             obtido = cliente.get(rota.format(data=dia.isoformat()))
             obtido.raise_for_status()
             rel.conferir(f"{proc} {dia:%Y-%m}", obtido.json().get(coluna), esperado)
+        for rota, proc, coluna, mart, coluna_mart in comparativos:
+            obtido = cliente.get(rota.format(data=dia.isoformat()))
+            obtido.raise_for_status()
+            corpo = obtido.json()
+            rel.conferir(
+                f"{proc} {dia:%Y-%m} MesAtual",
+                corpo["MesAtual"][coluna],
+                _linha_legada(_primeira(proc, (_ddmmyyyy(dia),)), coluna),
+            )
+            anterior = kpis._mes_anterior(dia)
+            rel.conferir(
+                f"{proc} {dia:%Y-%m} MesAnterior",
+                corpo["MesAnterior"][coluna],
+                _linha_legada(_primeira(proc, (_ddmmyyyy(anterior),)), coluna),
+            )
+            rel.conferir(
+                f"{proc} {dia:%Y-%m} AnoAtual",
+                corpo["AnoAtual"][coluna],
+                _soma_mart(mart, coluna_mart, date(dia.year, 1, 1), kpis._proximo_mes(dia)),
+            )
+            rel.conferir(
+                f"{proc} {dia:%Y-%m} AnoAnterior",
+                corpo["AnoAnterior"][coluna],
+                _soma_mart(mart, coluna_mart, date(dia.year - 1, 1, 1), date(dia.year, 1, 1)),
+            )
     return rel
 
 
@@ -137,7 +185,7 @@ def validar_custos(cliente: TestClient) -> Relatorio:
     que devolve as janelas (mês atual, mês anterior, 12m, ano atual, ano anterior). Conferimos
     que a API entrega o recorte certo para cada rota:
     - mensal → mês atual (grande) + `MesAnterior` (pequeno);
-    - anual → Σ dos 12 meses fechados ÷ 12 (média mensal, como o legado).
+    - anual → Σ dos 12 meses fechados como `Total` + `Media` (÷12).
     """
     print("\n== custos administrativos (uspCustoAdmComparativo) ==")
     rel = Relatorio()
@@ -161,11 +209,9 @@ def validar_custos(cliente: TestClient) -> Relatorio:
     corpo = anual.json()
     doze = janelas["ultimos_12_meses"]
     for chave in ("Faturamento", "Administrativo"):
-        rel.conferir(
-            f"anual.{chave}",
-            corpo[chave],
-            _dec(_linha_legada(doze, chave)) / 12,
-        )
+        total = _dec(_linha_legada(doze, chave))
+        rel.conferir(f"anual.{chave}.Total", corpo[chave]["Total"], total)
+        rel.conferir(f"anual.{chave}.Media", corpo[chave]["Media"], total / 12)
     return rel
 
 
@@ -293,28 +339,39 @@ def validar_dados(cliente: TestClient, produto: str = "000015") -> Relatorio:
     return rel
 
 
+def _nested(valor: dict, *caminho: str):
+    for passo in caminho:
+        valor = valor[passo]
+    return valor
+
+
 def validar_dashboard(cliente: TestClient, dia: date = date(2026, 3, 1)) -> Relatorio:
     """`/dashboard-completo` precisa bater com as rotas individuais."""
     print("\n== /dashboard-completo (agrega as rotas) ==")
     rel = Relatorio()
     completo = cliente.get(f"/dashboard-completo/{dia.isoformat()}").json()
-    for chave, rota, *formato in (
+    for chave, rota, *caminho in (
         ("faturamento", "/faturamento/{data}", "Faturamento"),
         ("faturamento_dia", "/faturamento-dia/{data}", "Faturamento"),
-        ("contas_pagas", "/contas-pagas/{data}", "ContasPagas"),
-        ("descontos", "/descontos/{data}", "Desconto"),
-        ("devolucoes", "/devolucoes/{data}", "Devolucao"),
-        ("estornos", "/estornos/{data}", "Estorno"),
+        ("contas_pagas", "/contas-pagas/{data}", "MesAtual", "ContasPagas"),
+        ("descontos", "/descontos/{data}", "MesAtual", "Desconto"),
+        ("devolucoes", "/devolucoes/{data}", "MesAtual", "Devolucao"),
+        ("estornos", "/estornos/{data}", "MesAtual", "Estorno"),
         ("contas_receber_programado", "/contas-receber-programado", "QtdeDoc"),
         ("contas_pagar_programado", "/contas-pagar-programado", "QtdeDoc"),
-        ("custos_administrativos_anual", "/custos-administrativos-anual", "Faturamento"),
+        (
+            "custos_administrativos_anual",
+            "/custos-administrativos-anual",
+            "Administrativo",
+            "Media",
+        ),
         ("custos_administrativos_mensal", "/custos-administrativos-mensal", "Administrativo"),
     ):
         url = rota.format(data=dia.isoformat()) if "{data}" in rota else rota
         rel.conferir(
             f"dashboard.{chave}",
-            completo[chave][formato[0]],
-            cliente.get(url).json()[formato[0]],
+            _nested(completo[chave], *caminho),
+            _nested(cliente.get(url).json(), *caminho),
         )
     return rel
 

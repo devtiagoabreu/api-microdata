@@ -10,8 +10,12 @@ legado, inclusive as escolhas que parecem erro e não são (ver Doc 44):
 - a "janela de programmed" (`Vencimento >= 1º dia do mês corrente`, <= 2050-12-31) era aplicada
   pelas procedures, não pelas views, então ela mora aqui — e o mês de corte é o **corrente**,
   não o seguinte (medido contra `uspDashFinanceiroContas*Programado`);
-- o "anual" de custos divide o faturamento por 12 (média mensal) e devolve `Armazenagem = 0`; o
-  "mensal" agora é o **mês atual** (grande) + `MesAnterior` (pequeno), sem o acúmulo histórico.
+- as rotas mensais de valor (`/contas-pagas`, `/descontos`, `/devolucoes`, `/estornos`) devolvem
+  um **comparativo** com 4 janelas (`MesAtual`, `MesAnterior`, `AnoAtual`, `AnoAnterior`) para o
+  card do BI — `AnoAtual` acumula de 1º/jan até o fim do mês de `data`;
+- o "anual" de custos devolve `Faturamento`/`Administrativo` com `Total` (Σ 12 meses fechados) e
+  `Media` (÷12), e `Armazenagem`/`Porc_Armazenagem` saíram do contrato (sempre 0 no legado); o
+  "mensal" é o **mês atual** (grande) + `MesAnterior` (pequeno), sem o acúmulo histórico.
 """
 
 from __future__ import annotations
@@ -62,6 +66,39 @@ def _soma(sql: str, params: dict[str, Any] | None = None) -> float:
     return float(list(linha[0].values())[0] or 0) if linha else 0.0
 
 
+def _mes_anterior(valor: date) -> date:
+    """Primeiro dia do mês imediatamente anterior ao mês de `valor`."""
+    inicio = _primeiro_dia(valor)
+    return date(inicio.year - (inicio.month == 1), inicio.month - 1 or 12, 1)
+
+
+def _somatorio(mart: str, coluna: str, inicio: date, fim: date) -> float:
+    """Σ de uma coluna diária do mart na janela [inicio, fim) — `fim` exclusiva."""
+    return _soma(
+        f"select sum({coluna}) from {mart} where data >= :inicio and data < :fim",
+        {"inicio": inicio, "fim": fim},
+    )
+
+
+def _comparativo(data: date, mart: str, coluna: str, rotulo: str) -> dict[str, dict[str, float]]:
+    """4 janelas para as rotas mensais de valor (Doc 44 #6/#9/#10/#11).
+
+    `MesAtual` e `MesAnterior` espelham a janela da `usp` legada (mês de `data`); `AnoAtual`
+    acumula de 1º/jan do ano de `data` até o fim desse mês; `AnoAnterior` é o ano inteiro.
+    """
+    inicio_mes = _primeiro_dia(data)
+    janelas = (
+        ("MesAtual", inicio_mes, _proximo_mes(inicio_mes)),
+        ("MesAnterior", _mes_anterior(inicio_mes), inicio_mes),
+        ("AnoAtual", date(data.year, 1, 1), _proximo_mes(inicio_mes)),
+        ("AnoAnterior", date(data.year - 1, 1, 1), date(data.year, 1, 1)),
+    )
+    return {
+        nome: {rotulo: _somatorio(mart, coluna, inicio, fim)}
+        for nome, inicio, fim in janelas
+    }
+
+
 # ---------------------------------------------------------------- faturamento
 
 
@@ -90,65 +127,37 @@ def faturamento_dia(data: date, usuario: _faturamento) -> dict[str, float]:
 
 
 @router.get("/descontos/{data}")
-def descontos(data: date, usuario: _faturamento) -> dict[str, float]:
-    """`uspDesconto`: Σ(Acres_Desc) do mês de `data`."""
-    inicio = _primeiro_dia(data)
-    return {
-        "Desconto": _soma(
-            "select sum(desconto) from marts.faturamento_diario "
-            "where data >= :inicio and data < :fim",
-            {"inicio": inicio, "fim": _proximo_mes(inicio)},
-        )
-    }
+def descontos(data: date, usuario: _faturamento) -> dict[str, Any]:
+    """`uspDesconto`: Σ(Acres_Desc) do mês de `data` + comparativo com as 4 janelas."""
+    return _comparativo(data, "marts.faturamento_diario", "desconto", "Desconto")
 
 
 # --------------------------------------------------------------- contas pagas
 
 
 @router.get("/contas-pagas/{data}")
-def contas_pagas(data: date, usuario: _financeiro) -> dict[str, float]:
-    """`uspListagemBaixasPagar`: Σ das baixas pagas no mês de `data`.
+def contas_pagas(data: date, usuario: _financeiro) -> dict[str, Any]:
+    """`uspListagemBaixasPagar`: Σ das baixas pagas no mês de `data` + comparativo 4 janelas.
 
     No legado o `SELECT` estava comentado e a rota respondia `{}`, mas a `usp` devolve a coluna
     `ContasPagas` — é esse o contrato adotado aqui (Doc 44 #6, atualizado).
     """
-    inicio = _primeiro_dia(data)
-    return {
-        "ContasPagas": _soma(
-            "select sum(valor_pago) from marts.contas_pagas_diario "
-            "where data >= :inicio and data < :fim",
-            {"inicio": inicio, "fim": _proximo_mes(inicio)},
-        )
-    }
+    return _comparativo(data, "marts.contas_pagas_diario", "valor_pago", "ContasPagas")
 
 
 # ------------------------------------------------------- devoluções/estornos
 
 
 @router.get("/devolucoes/{data}")
-def devolucoes(data: date, usuario: _faturamento) -> dict[str, float]:
-    """`uspDevolucao`: Σ(Vr_Contabil) das naturezas de devolução no mês de `data`."""
-    inicio = _primeiro_dia(data)
-    return {
-        "Devolucao": _soma(
-            "select sum(valor) from marts.devolucoes_diario "
-            "where data >= :inicio and data < :fim",
-            {"inicio": inicio, "fim": _proximo_mes(inicio)},
-        )
-    }
+def devolucoes(data: date, usuario: _faturamento) -> dict[str, Any]:
+    """`uspDevolucao`: Σ(Vr_Contabil) das naturezas de devolução no mês de `data` + comparativo."""
+    return _comparativo(data, "marts.devolucoes_diario", "valor", "Devolucao")
 
 
 @router.get("/estornos/{data}")
-def estornos(data: date, usuario: _faturamento) -> dict[str, float]:
-    """`uspEstorno`: Σ(Vr_Nota) por `Data_Emissao` no mês de `data`."""
-    inicio = _primeiro_dia(data)
-    return {
-        "Estorno": _soma(
-            "select sum(valor_nota) from marts.estornos_diario "
-            "where data >= :inicio and data < :fim",
-            {"inicio": inicio, "fim": _proximo_mes(inicio)},
-        )
-    }
+def estornos(data: date, usuario: _faturamento) -> dict[str, Any]:
+    """`uspEstorno`: Σ(Vr_Nota) por `Data_Emissao` no mês de `data` + comparativo."""
+    return _comparativo(data, "marts.estornos_diario", "valor_nota", "Estorno")
 
 
 # ------------------------------------------------------------- programmed
@@ -200,35 +209,43 @@ def _custos(referencia: date, anual: bool) -> dict[str, Any]:
     12 meses fechados, ano atual e ano anterior. Corrige o quirk do legado, onde o
     `Administrativo` somava o histórico inteiro (`Porc_Administrativo` de 1758% no mensal).
 
-    - mensal = **mês atual** (card grande) + `MesAnterior` (card pequeno);
-    - anual = Σ dos **12 meses fechados** ÷ 12 (média mensal, como no legado).
+    - mensal = **mês atual** (grande) + `MesAnterior` (pequeno);
+    - anual = Σ dos **12 meses fechados** devolvendo `Total` e `Media` (÷12). `Armazenagem` e
+      `Porc_Armazenagem` saíram do contrato (sempre 0 no legado — Doc 44 #7/#8).
     """
     linhas = erp.query("exec DBProDash.dbo.uspCustoAdmComparativo ?", (referencia,))
     janelas = {linha["janela"]: linha for linha in linhas}
 
-    def _recorte(janela: str, divisor: int) -> dict[str, Any]:
-        faturamento = float(janelas[janela]["Faturamento"] or 0) / divisor
-        administrativo = float(janelas[janela]["Administrativo"] or 0) / divisor
+    def _medida(janela: str) -> dict[str, Any]:
+        faturamento = float(janelas[janela]["Faturamento"] or 0)
+        administrativo = float(janelas[janela]["Administrativo"] or 0)
         return {
             "Faturamento": faturamento,
             "Administrativo": administrativo,
-            "Armazenagem": 0.0,
-            "Porc_Administrativo": (
-                administrativo / faturamento if faturamento else 0.0
-            ),
-            "Porc_Armazenagem": 0.0,
+            "Porc_Administrativo": administrativo / faturamento if faturamento else 0.0,
         }
 
     if anual:
-        return _recorte("ultimos_12_meses", 12)
-    atual = _recorte("mes_atual", 1)
-    atual["MesAnterior"] = _recorte("mes_anterior", 1)
+        totais = _medida("ultimos_12_meses")
+        return {
+            "Faturamento": {
+                "Total": totais["Faturamento"],
+                "Media": totais["Faturamento"] / 12,
+            },
+            "Administrativo": {
+                "Total": totais["Administrativo"],
+                "Media": totais["Administrativo"] / 12,
+            },
+            "Porc_Administrativo": totais["Porc_Administrativo"],
+        }
+    atual = _medida("mes_atual")
+    atual["MesAnterior"] = _medida("mes_anterior")
     return atual
 
 
 @router.get("/custos-administrativos-anual")
 def custos_administrativos_anual(usuario: _financeiro, data: date | None = None) -> dict[str, Any]:
-    """`uspCustoAdmComparativo`: Σ dos 12 meses fechados ÷ 12 (média mensal).
+    """`uspCustoAdmComparativo`: Σ dos 12 meses fechados — `Total` e `Media` (÷12).
 
     `data` (opcional, padrão hoje) ancora a janela na procedure.
     """
