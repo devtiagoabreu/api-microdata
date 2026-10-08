@@ -120,6 +120,77 @@ class TestContratoEnriquecido:
         assert corpo["ValorTotalMes"] <= corpo["ValorTotal"] + 0.01
 
 
+class TestLeituraAoVivo:
+    """Frescor: as rotas de valor leem o ERP no request — mart atrasado não serve."""
+
+    def test_faturamento_dia_le_o_erp_e_ignora_o_mart(self, monkeypatch):
+        consultas: list[tuple[str, tuple]] = []
+
+        def consulta(sql, params=()):
+            consultas.append((sql, params))
+            return [{"dia": date(2026, 3, 15), "total": 1234.5}]
+
+        monkeypatch.setattr(kpis.erp, "query", consulta)
+        corpo = client.get("/faturamento-dia/2026-03-15").json()
+        assert corpo == {"Faturamento": 1234.5, "Ontem": 0.0, "Anteontem": 0.0}
+        assert consultas, "a rota precisa consultar o ERP"
+        assert all("marts." not in sql for sql, _ in consultas)
+        assert any("vwFaturamento" in sql for sql, _ in consultas)
+
+    def test_comparativo_soma_as_quatro_janelas_de_uma_unica_query(self, monkeypatch):
+        consultas: list[tuple[str, tuple]] = []
+
+        def consulta(sql, params=()):
+            consultas.append((sql, params))
+            return [
+                {"mes": date(2025, 12, 1), "total": 30.0},
+                {"mes": date(2026, 1, 1), "total": 100.0},
+                {"mes": date(2026, 2, 1), "total": 50.0},
+            ]
+
+        monkeypatch.setattr(kpis.erp, "query", consulta)
+        corpo = client.get("/descontos/2026-02-15").json()
+        assert corpo["MesAtual"]["Desconto"] == 50.0
+        assert corpo["MesAnterior"]["Desconto"] == 100.0
+        assert corpo["AnoAtual"]["Desconto"] == 150.0
+        assert corpo["AnoAnterior"]["Desconto"] == 30.0
+        assert len(consultas) == 1, "as 4 janelas saem de um único scan no ERP"
+        assert consultas[0][1] == (date(2025, 1, 1), date(2026, 3, 1))
+        assert "marts." not in consultas[0][0]
+
+    @pytest.mark.parametrize(
+        "rota,fonte",
+        [
+            ("/contas-receber-programado", "vwFinanceiroContasReceber"),
+            ("/contas-pagar-programado", "vwFinanceiroContasPagar"),
+        ],
+    )
+    def test_programado_le_os_titulos_ao_vivo_com_a_janela_do_mes(
+        self, monkeypatch, rota, fonte
+    ):
+        consultas: list[tuple[str, tuple]] = []
+
+        def consulta(sql, params=()):
+            consultas.append((sql, params))
+            return [
+                {"documentos": 10, "valor": 1000.0, "documentos_mes": 4, "valor_mes": 400.0}
+            ]
+
+        monkeypatch.setattr(kpis.erp, "query", consulta)
+        corpo = client.get(rota).json()
+        assert corpo == {
+            "QtdeDoc": 10,
+            "ValorTotal": 1000.0,
+            "QtdeDocMes": 4,
+            "ValorTotalMes": 400.0,
+        }
+        sql, params = consultas[0]
+        assert fonte in sql
+        # params: (fim_mes, fim_mes, 1º do mês corrente, teto de 2050)
+        assert params[2] == date.today().replace(day=1)
+        assert params[3] == kpis.LIMITE_VENCIMENTO
+
+
 class TestPdfSugestaoDeRolos:
     """Contrato #3: mesmo cartao do legado, sem arquivo temporario em disco."""
 

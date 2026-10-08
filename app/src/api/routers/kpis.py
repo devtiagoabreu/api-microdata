@@ -1,13 +1,13 @@
 ﻿"""Rotas de KPI do dashboard (contrato do legado, Doc 44 #4 a #14).
 
-Cada rota lê um mart do warehouse local em vez de executar uma `usp` do `DBProDash`: o legado
-fazia até 10 `EXEC` por request (`/dashboard-completo`), aqui a leitura é uma query por KPI sobre
-`marts` — exceto os custos, que consultam `uspCustoAdmComparativo` no `DBProDash` (a procedure
-agrega o rateio **ao vivo** de `sp_PagRel_CCusto_Niveis`, corrigindo o `Rel_CCusto_Niveis` que o
-ETL espelha congelado; ver Doc 44 #7/#8), e o `/faturamento`, que lê o `vwFaturamento` ao vivo
-para o mês atual bater sempre com o card de custos (o mart pode estar atrasado). As chaves do JSON
-e as regras de janela continuam as do legado, inclusive as escolhas que parecem erro e não são
-(ver Doc 44):
+Todas as rotas de valor lêem o **ERP ao vivo** (views do `DBProDash`/`Microdata`, as mesmas
+fontes das `usp` do legado) em vez dos marts do warehouse local: o ETL roda em lote e os marts
+podem ficar atrasados (ex.: sem o dia de ontem), e o BI precisa de dados frescos no momento em
+que o usuário carrega a tela. O warehouse continua alimentando a publicação no Neon
+(`src.etl.publicar`) e as rotas de estoque (`/dados`, `/sugestao-rolos`).
+
+As chaves do JSON e as regras de janela continuam as do legado, inclusive as escolhas que
+parecem erro e não são (ver Doc 44):
 
 - a "janela de programmed" (`Vencimento >= 1º dia do mês corrente`, <= 2050-12-31) era aplicada
   pelas procedures, não pelas views, então ela mora aqui — e o mês de corte é o **corrente**,
@@ -15,11 +15,12 @@ e as regras de janela continuam as do legado, inclusive as escolhas que parecem 
 - as rotas mensais de valor (`/faturamento`, `/contas-pagas`, `/descontos`, `/devolucoes`,
   `/estornos`) devolvem um **comparativo** com 4 janelas (`MesAtual`, `MesAnterior`, `AnoAtual`,
   `AnoAnterior`) para o card do BI — `AnoAtual` acumula de 1º/jan até o fim do mês de `data`;
-  o `/faturamento` lê o `vwFaturamento` **ao vivo** (mesma fonte do custos), porque o mart
-  `faturamento_diario` pode estar atrasado e divergir do card de custos;
+  como as 4 janelas são alinhadas ao mês, uma única query agrupada por mês no ERP cobre as 4
+  num único scan;
 - o "anual" de custos devolve `Faturamento`/`Administrativo` com `Total` (Σ 12 meses fechados) e
   `Media` (÷12), e `Armazenagem`/`Porc_Armazenagem` saíram do contrato (sempre 0 no legado); o
-  "mensal" é o **mês atual** (grande) + `MesAnterior` (pequeno), sem o acúmulo histórico.
+  "mensal" é o **mês atual** (grande) + `MesAnterior` (pequeno), sem o acúmulo histórico — a
+  `uspCustoAdmComparativo` agrega o rateio **ao vivo** de `sp_PagRel_CCusto_Niveis`.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from datetime import date, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import text
 
 from src.api.auth.escopos import (
     ESCOPO_FATURAMENTO,
@@ -36,7 +36,7 @@ from src.api.auth.escopos import (
     exigir_escopo,
 )
 from src.api.auth.usuarios import Usuario
-from src.db import erp, warehouse
+from src.db import erp
 from src.etl import publicar
 
 router = APIRouter(tags=["kpis"])
@@ -51,11 +51,6 @@ _dashboard = Annotated[
 LIMITE_VENCIMENTO = date(2050, 12, 31)
 
 
-def _consultar(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    with warehouse.engine().connect() as conn:
-        return [dict(linha) for linha in conn.execute(text(sql), params or {}).mappings()]
-
-
 def _primeiro_dia(valor: date) -> date:
     return valor.replace(day=1)
 
@@ -65,23 +60,10 @@ def _proximo_mes(valor: date) -> date:
     return date(inicio.year + (inicio.month == 12), inicio.month % 12 + 1, 1)
 
 
-def _soma(sql: str, params: dict[str, Any] | None = None) -> float:
-    linha = _consultar(sql, params)
-    return float(list(linha[0].values())[0] or 0) if linha else 0.0
-
-
 def _mes_anterior(valor: date) -> date:
     """Primeiro dia do mês imediatamente anterior ao mês de `valor`."""
     inicio = _primeiro_dia(valor)
     return date(inicio.year - (inicio.month == 1), inicio.month - 1 or 12, 1)
-
-
-def _somatorio(mart: str, coluna: str, inicio: date, fim: date) -> float:
-    """Σ de uma coluna diária do mart na janela [inicio, fim) — `fim` exclusiva."""
-    return _soma(
-        f"select sum({coluna}) from {mart} where data >= :inicio and data < :fim",
-        {"inicio": inicio, "fim": fim},
-    )
 
 
 def _janelas_4(data: date) -> tuple[tuple[str, date, date], ...]:
@@ -99,66 +81,110 @@ def _janelas_4(data: date) -> tuple[tuple[str, date, date], ...]:
     )
 
 
-def _comparativo(data: date, mart: str, coluna: str, rotulo: str) -> dict[str, dict[str, float]]:
-    """4 janelas de valor lidas de um mart do warehouse (Doc 44 #6/#9/#10/#11)."""
+def _comparativo_vivo(data: date, sql: str, rotulo: str) -> dict[str, dict[str, float]]:
+    """As 4 janelas do comparativo somadas de uma única consulta mensal **ao vivo** no ERP.
+
+    A `sql` recebe `(inicio, fim)` e devolve `mes` (1º do mês) + `total`. As janelas de
+    `_janelas_4` são todas alinhadas ao mês, então o intervalo de [1º/jan do ano anterior,
+    1º/mês seguinte) as cobre todas num único scan — leitura fresca sem depender do ETL.
+    """
+    linhas = erp.query(sql, (date(data.year - 1, 1, 1), _proximo_mes(data)))
+    mensal: dict[tuple[int, int], float] = {}
+    for linha in linhas:
+        mes = linha["mes"]
+        chave = (mes.year, mes.month)
+        mensal[chave] = mensal.get(chave, 0.0) + float(linha["total"] or 0)
+
+    def soma(inicio: date, fim: date) -> float:
+        return sum(
+            valor
+            for (ano, mes), valor in mensal.items()
+            if inicio <= date(ano, mes, 1) < fim
+        )
+
     return {
-        nome: {rotulo: _somatorio(mart, coluna, inicio, fim)}
+        nome: {rotulo: soma(inicio, fim)}
         for nome, inicio, fim in _janelas_4(data)
     }
 
 
 # ---------------------------------------------------------------- faturamento
+# Consultas mensais no ERP: uma por KPI, reutilizadas pelas 4 janelas do comparativo.
 
+SQL_FATURAMENTO_MENSAL = (
+    "select datefromparts(year(Data_Nota), month(Data_Nota), 1) as mes, "
+    "coalesce(sum(Vr_Total), 0) + coalesce(sum(Acres_Desc), 0) as total "
+    "from DBProDash.dbo.vwFaturamento "
+    "where Data_Nota >= ? and Data_Nota < ? "
+    "group by datefromparts(year(Data_Nota), month(Data_Nota), 1)"
+)
 
-def _faturamento_vivo(inicio: date, fim: date) -> float:
-    """Σ(Vr_Total)+Σ(Acres_Desc) de `vwFaturamento` em [inicio, fim), a fonte viva do legado.
+SQL_DESCONTOS_MENSAL = (
+    "select datefromparts(year(Data_Nota), month(Data_Nota), 1) as mes, "
+    "coalesce(sum(Acres_Desc), 0) as total "
+    "from DBProDash.dbo.vwFaturamento "
+    "where Data_Nota >= ? and Data_Nota < ? "
+    "group by datefromparts(year(Data_Nota), month(Data_Nota), 1)"
+)
 
-    O mart `faturamento_diario` espelha essas duas colunas, mas o ETL pode estar atrasado (ex.:
-    sem o dia de ontem), fazendo o card divergir dos custos. Aqui lemos o mesmo `vwFaturamento`
-    do `uspCustoAdmComparativo`, então mês atual/anterior batem sempre com o card de custos.
-    """
-    linhas = erp.query(
-        "select coalesce(sum(Vr_Total), 0) + coalesce(sum(Acres_Desc), 0) as faturamento "
-        "from DBProDash.dbo.vwFaturamento where Data_Nota >= ? and Data_Nota < ?",
-        (inicio, fim),
-    )
-    return float(linhas[0]["faturamento"] or 0)
+SQL_CONTAS_PAGAS_MENSAL = (
+    "select datefromparts(year(Data_Baixa), month(Data_Baixa), 1) as mes, "
+    "coalesce(sum(valorPago), 0) as total "
+    "from DBProDash.dbo.vwContasPagas "
+    "where Data_Baixa >= ? and Data_Baixa < ? "
+    "group by datefromparts(year(Data_Baixa), month(Data_Baixa), 1)"
+)
+
+SQL_DEVOLUCOES_MENSAL = (
+    "select datefromparts(year(Data), month(Data), 1) as mes, "
+    "coalesce(sum(Vr_CONtabil), 0) as total "
+    "from DBProDash.dbo.vwListagemDeEntradasSaidasPorCFOP "
+    "where Nova_CFOP in ('1.201-1', '1.201-2', '1.202-1', '2.202-1') "
+    "and Data >= ? and Data < ? "
+    "group by datefromparts(year(Data), month(Data), 1)"
+)
+
+SQL_ESTORNOS_MENSAL = (
+    "select datefromparts(year(Data_Emissao), month(Data_Emissao), 1) as mes, "
+    "coalesce(sum(Vr_Nota), 0) as total "
+    "from DBProDash.dbo.vwListagemDeEstornos "
+    "where Data_Emissao >= ? and Data_Emissao < ? "
+    "group by datefromparts(year(Data_Emissao), month(Data_Emissao), 1)"
+)
 
 
 @router.get("/faturamento/{data}")
 def faturamento(data: date, usuario: _faturamento) -> dict[str, Any]:
     """`uspFaturamento`: Σ(Vr_Total)+Σ(Acres_Desc) do mês de `data` + comparativo 4 janelas.
 
-    Lê o `vwFaturamento` **ao vivo** (mesma fonte dos custos) em vez do mart, para o card
-    "Faturamento" do BI mostrar o mesmo mês atual que o custos-administrativos-mensal.
+    Lê o `vwFaturamento` **ao vivo** (mesma fonte dos custos): o card "Faturamento" do BI
+    mostra o mesmo mês atual do custos-administrativos-mensal mesmo sem ETL recente.
     """
-    return {
-        nome: {"Faturamento": _faturamento_vivo(inicio, fim)}
-        for nome, inicio, fim in _janelas_4(data)
-    }
+    return _comparativo_vivo(data, SQL_FATURAMENTO_MENSAL, "Faturamento")
 
 
 @router.get("/faturamento-dia/{data}")
 def faturamento_dia(data: date, usuario: _faturamento) -> dict[str, float]:
     """`uspFaturamentoDia`: mesmo cálculo, por **dia** (`ISNULL(...,0)` no legado).
 
-    Além do dia selecionado devolve `Ontem` (data − 1) e `Anteontem` (data − 2) numa
-    única query, para o card diário do BI mostrar os 3 últimos dias sem 3 chamadas.
+    Além do dia selecionado devolve `Ontem` (data − 1) e `Anteontem` (data − 2) numa única
+    query **ao vivo** no `vwFaturamento` — o mart pode não ter o dia ainda, e o card diário
+    do BI precisa do valor de hoje no momento em que o usuário carrega.
     """
     ontem = data - timedelta(days=1)
     anteontem = data - timedelta(days=2)
-    linhas = _consultar(
-        "select data, coalesce(sum(faturamento), 0) as total "
-        "from marts.faturamento_diario "
-        "where data in (:d0, :d1, :d2) group by data",
-        {"d0": data, "d1": ontem, "d2": anteontem},
+    linhas = erp.query(
+        "select cast(Data_Nota as date) as dia, "
+        "coalesce(sum(Vr_Total), 0) + coalesce(sum(Acres_Desc), 0) as total "
+        "from DBProDash.dbo.vwFaturamento "
+        "where Data_Nota >= ? and Data_Nota < ? "
+        "group by cast(Data_Nota as date)",
+        (anteontem, data + timedelta(days=1)),
     )
     valores: dict[date, float] = {data: 0.0, ontem: 0.0, anteontem: 0.0}
     for linha in linhas:
-        dia = linha["data"]
-        if not isinstance(dia, date):
-            dia = dia.date()
-        valores[dia] = float(linha["total"] or 0)
+        dia = linha["dia"]
+        valores[date(dia.year, dia.month, dia.day)] = float(linha["total"] or 0)
     return {
         "Faturamento": valores[data],
         "Ontem": valores[ontem],
@@ -169,7 +195,7 @@ def faturamento_dia(data: date, usuario: _faturamento) -> dict[str, float]:
 @router.get("/descontos/{data}")
 def descontos(data: date, usuario: _faturamento) -> dict[str, Any]:
     """`uspDesconto`: Σ(Acres_Desc) do mês de `data` + comparativo com as 4 janelas."""
-    return _comparativo(data, "marts.faturamento_diario", "desconto", "Desconto")
+    return _comparativo_vivo(data, SQL_DESCONTOS_MENSAL, "Desconto")
 
 
 # --------------------------------------------------------------- contas pagas
@@ -182,7 +208,7 @@ def contas_pagas(data: date, usuario: _financeiro) -> dict[str, Any]:
     No legado o `SELECT` estava comentado e a rota respondia `{}`, mas a `usp` devolve a coluna
     `ContasPagas` — é esse o contrato adotado aqui (Doc 44 #6, atualizado).
     """
-    return _comparativo(data, "marts.contas_pagas_diario", "valor_pago", "ContasPagas")
+    return _comparativo_vivo(data, SQL_CONTAS_PAGAS_MENSAL, "ContasPagas")
 
 
 # ------------------------------------------------------- devoluções/estornos
@@ -191,32 +217,51 @@ def contas_pagas(data: date, usuario: _financeiro) -> dict[str, Any]:
 @router.get("/devolucoes/{data}")
 def devolucoes(data: date, usuario: _faturamento) -> dict[str, Any]:
     """`uspDevolucao`: Σ(Vr_Contabil) das naturezas de devolução no mês de `data` + comparativo."""
-    return _comparativo(data, "marts.devolucoes_diario", "valor", "Devolucao")
+    return _comparativo_vivo(data, SQL_DEVOLUCOES_MENSAL, "Devolucao")
 
 
 @router.get("/estornos/{data}")
 def estornos(data: date, usuario: _faturamento) -> dict[str, Any]:
     """`uspEstorno`: Σ(Vr_Nota) por `Data_Emissao` no mês de `data` + comparativo."""
-    return _comparativo(data, "marts.estornos_diario", "valor_nota", "Estorno")
+    return _comparativo_vivo(data, SQL_ESTORNOS_MENSAL, "Estorno")
 
 
 # ------------------------------------------------------------- programmed
+# A janela do mês entra na query (CASE) — as views não filtram, as procedures filtravam.
+
+SQL_RECEBER_PROGRAMADO = (
+    "select count(*) as documentos, coalesce(sum(ValorTotal), 0) as valor, "
+    "sum(case when Vencimento < ? then 1 else 0 end) as documentos_mes, "
+    "coalesce(sum(case when Vencimento < ? then ValorTotal else 0 end), 0) as valor_mes "
+    "from DBProDash.dbo.vwFinanceiroContasReceber "
+    "where Vencimento >= ? and Vencimento <= ?"
+)
+
+SQL_PAGAR_PROGRAMADO = (
+    "select count(distinct case when Vencimento < ? then cast(QtdeDoc as varchar(60)) end) "
+    "as documentos_mes, "
+    "coalesce(sum(case when Vencimento < ? then ValorTotal else 0 end), 0) as valor_mes, "
+    "count(distinct cast(QtdeDoc as varchar(60))) as documentos, "
+    "coalesce(sum(ValorTotal), 0) as valor "
+    "from DBProDash.dbo.vwFinanceiroContasPagar "
+    "where Vencimento >= ? and Vencimento <= ?"
+)
 
 
 @router.get("/contas-receber-programado")
 def contas_receber_programado(usuario: _financeiro) -> dict[str, Any]:
-    """`uspDashFinanceiroContasReceberProgramado`: COUNT(QtdeDoc) e Σ(ValorTotal)."""
-    return _programado("marts.financeiro_receber_programado", distinct=False)
+    """`uspDashFinanceiroContasReceberProgramado`: COUNT(QtdeDoc) e Σ(ValorTotal) ao vivo."""
+    return _programado(SQL_RECEBER_PROGRAMADO)
 
 
 @router.get("/contas-pagar-programado")
 def contas_pagar_programado(usuario: _financeiro) -> dict[str, Any]:
     """`uspDashFinanceiroContasPagarProgramado`: COUNT(DISTINCT QtdeDoc) — diferença do legado."""
-    return _programado("marts.financeiro_pagar_programado", distinct=True)
+    return _programado(SQL_PAGAR_PROGRAMADO)
 
 
-def _programado(origem: str, *, distinct: bool) -> dict[str, Any]:
-    """Aplica a janela que as procedures aplicavam: vencimento de 1º/mês corrente até 2050-12-31.
+def _programado(sql: str) -> dict[str, Any]:
+    """Títulos em aberto **ao vivo** no ERP com a janela que as procedures aplicavam.
 
     A regra real (medida contra `uspDashFinanceiroContas*Programado`) é `>= 1º dia do mês
     corrente`, não `>= 1º/mês seguinte`: o "programado" inclui os vencidos do próprio mês.
@@ -227,26 +272,15 @@ def _programado(origem: str, *, distinct: bool) -> dict[str, Any]:
     (vencimento entre 1º e o último dia do mês) para o card do BI mostrar o que vence
     neste mês ao lado do total programado.
     """
-    contagem = "count(distinct qtde_doc)" if distinct else "count(*)"
     hoje = date.today()
     inicio_mes = _primeiro_dia(hoje)
     fim_mes = _proximo_mes(inicio_mes)
-    linha = _consultar(
-        f"""
-        select {contagem} as documentos,
-               coalesce(sum(valor_total), 0) as valor,
-               {contagem} filter (where vencimento < :fim_mes) as documentos_mes,
-               coalesce(sum(valor_total) filter (where vencimento < :fim_mes), 0) as valor_mes
-          from {origem}
-         where vencimento >= :inicio and vencimento <= :limite
-        """,
-        {"inicio": inicio_mes, "limite": LIMITE_VENCIMENTO, "fim_mes": fim_mes},
-    )
+    linha = erp.query(sql, (fim_mes, fim_mes, inicio_mes, LIMITE_VENCIMENTO))[0]
     return {
-        "QtdeDoc": int(linha[0]["documentos"] or 0),
-        "ValorTotal": float(linha[0]["valor"] or 0),
-        "QtdeDocMes": int(linha[0]["documentos_mes"] or 0),
-        "ValorTotalMes": float(linha[0]["valor_mes"] or 0),
+        "QtdeDoc": int(linha["documentos"] or 0),
+        "ValorTotal": float(linha["valor"] or 0),
+        "QtdeDocMes": int(linha["documentos_mes"] or 0),
+        "ValorTotalMes": float(linha["valor_mes"] or 0),
     }
 
 
@@ -328,7 +362,7 @@ def dashboard_completo(data: date, usuario: _dashboard) -> dict[str, Any]:
     E aqui que o **sync on-demand** acontece (D4): antes de responder, os agregados pequenos que o
     front le no Neon sao republicados **se** o warehouse carregou depois da ultima publicacao.
     Desligado por `NEON_PUBLICAR_AUTOMATICO=false` (padrao) e best-effort: se o sync falhar, a
-    resposta do KPI sai igual, lendo o warehouse local.
+    resposta do KPI sai igual — cada KPI lê o ERP ao vivo, sem depender do warehouse.
     """
     publicar.sincronizar_antes_do_dashboard()
     return {
