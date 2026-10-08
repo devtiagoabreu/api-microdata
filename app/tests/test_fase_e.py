@@ -101,6 +101,25 @@ class TestContratoComparativo:
         }
 
 
+class TestContratoEnriquecido:
+    """Cards do BI: faturamento diário com 3 dias e programados com a janela do mês."""
+
+    def test_faturamento_dia_devolve_hoje_ontem_e_anteontem(self):
+        corpo = client.get("/faturamento-dia/2026-03-15").json()
+        assert set(corpo) == {"Faturamento", "Ontem", "Anteontem"}
+        assert all(isinstance(v, (int, float)) for v in corpo.values())
+
+    @pytest.mark.parametrize(
+        "rota",
+        ["/contas-receber-programado", "/contas-pagar-programado"],
+    )
+    def test_programado_devolve_total_e_janela_do_mes(self, rota):
+        corpo = client.get(rota).json()
+        assert set(corpo) == {"QtdeDoc", "ValorTotal", "QtdeDocMes", "ValorTotalMes"}
+        assert corpo["QtdeDocMes"] <= corpo["QtdeDoc"]
+        assert corpo["ValorTotalMes"] <= corpo["ValorTotal"] + 0.01
+
+
 class TestPdfSugestaoDeRolos:
     """Contrato #3: mesmo cartao do legado, sem arquivo temporario em disco."""
 

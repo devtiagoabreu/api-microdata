@@ -24,7 +24,7 @@ e as regras de janela continuam as do legado, inclusive as escolhas que parecem 
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
@@ -140,12 +140,29 @@ def faturamento(data: date, usuario: _faturamento) -> dict[str, Any]:
 
 @router.get("/faturamento-dia/{data}")
 def faturamento_dia(data: date, usuario: _faturamento) -> dict[str, float]:
-    """`uspFaturamentoDia`: mesmo cálculo, por **dia** (`ISNULL(...,0)` no legado)."""
+    """`uspFaturamentoDia`: mesmo cálculo, por **dia** (`ISNULL(...,0)` no legado).
+
+    Além do dia selecionado devolve `Ontem` (data − 1) e `Anteontem` (data − 2) numa
+    única query, para o card diário do BI mostrar os 3 últimos dias sem 3 chamadas.
+    """
+    ontem = data - timedelta(days=1)
+    anteontem = data - timedelta(days=2)
+    linhas = _consultar(
+        "select data, coalesce(sum(faturamento), 0) as total "
+        "from marts.faturamento_diario "
+        "where data in (:d0, :d1, :d2) group by data",
+        {"d0": data, "d1": ontem, "d2": anteontem},
+    )
+    valores: dict[date, float] = {data: 0.0, ontem: 0.0, anteontem: 0.0}
+    for linha in linhas:
+        dia = linha["data"]
+        if not isinstance(dia, date):
+            dia = dia.date()
+        valores[dia] = float(linha["total"] or 0)
     return {
-        "Faturamento": _soma(
-            "select sum(faturamento) from marts.faturamento_diario where data = :data",
-            {"data": data},
-        )
+        "Faturamento": valores[data],
+        "Ontem": valores[ontem],
+        "Anteontem": valores[anteontem],
     }
 
 
@@ -204,20 +221,32 @@ def _programado(origem: str, *, distinct: bool) -> dict[str, Any]:
     A regra real (medida contra `uspDashFinanceiroContas*Programado`) é `>= 1º dia do mês
     corrente`, não `>= 1º/mês seguinte`: o "programado" inclui os vencidos do próprio mês.
     O teto de 2050-12-31 nunca limita hoje (vencimento máximo é 2029) e fica como rede de
-    segurança para não vazar registros com data zerada.
+    segurança para não vazair registros com data zerada.
+
+    Além do total, devolve `QtdeDocMes`/`ValorTotalMes` com a janela do **mês corrente**
+    (vencimento entre 1º e o último dia do mês) para o card do BI mostrar o que vence
+    neste mês ao lado do total programado.
     """
     contagem = "count(distinct qtde_doc)" if distinct else "count(*)"
+    hoje = date.today()
+    inicio_mes = _primeiro_dia(hoje)
+    fim_mes = _proximo_mes(inicio_mes)
     linha = _consultar(
         f"""
-        select {contagem} as documentos, coalesce(sum(valor_total), 0) as valor
+        select {contagem} as documentos,
+               coalesce(sum(valor_total), 0) as valor,
+               {contagem} filter (where vencimento < :fim_mes) as documentos_mes,
+               coalesce(sum(valor_total) filter (where vencimento < :fim_mes), 0) as valor_mes
           from {origem}
          where vencimento >= :inicio and vencimento <= :limite
         """,
-        {"inicio": _primeiro_dia(date.today()), "limite": LIMITE_VENCIMENTO},
+        {"inicio": inicio_mes, "limite": LIMITE_VENCIMENTO, "fim_mes": fim_mes},
     )
     return {
         "QtdeDoc": int(linha[0]["documentos"] or 0),
         "ValorTotal": float(linha[0]["valor"] or 0),
+        "QtdeDocMes": int(linha[0]["documentos_mes"] or 0),
+        "ValorTotalMes": float(linha[0]["valor_mes"] or 0),
     }
 
 
