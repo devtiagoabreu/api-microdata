@@ -9,10 +9,12 @@ O fluxo e de **base + delta**:
 - `POST /faturamento-detalhe/carga`: le o ERP ao vivo (mesma fonte de detalhe do card —
   `vwFaturamento` + `Fat_Pedido` + `Fat_Vend_Pedido` + `Rec_Vendedores`) dos ultimos 12
   meses e **substitui** o Neon (`delete` + `insert` na mesma transacao), gravando o
-  estado (`carga_completa`, `contagem`, `ultima_data` como watermark);
+  estado (`carga_completa`, `contagem`, `ultima_data` como watermark). Devolve os itens
+  lidos em `itens` — quem chamou a carga ja tem o que precisa, sem reler o Neon;
 - `POST /faturamento-detalhe/sync`: so o delta — notas com `Data_Nota >= ultima_data`
   (inclui a re-leitura do dia do watermark, inofensiva e que pega notas novas do mesmo
-  dia), `upsert` por PK, apaga o que saiu da janela de 12 meses e atualiza o estado;
+  dia), `upsert` por PK, apaga o que saiu da janela de 12 meses, atualiza o estado e
+  devolve **apenas os itens do delta** em `itens`;
 - `GET /faturamento-detalhe/estado`: o front decide se e hora de carregar/atualizar e
   evita bater na API a cada tela (o resto fica no IndexedDB do navegador);
 - `GET /faturamento-detalhe`: leitura paginada no Neon com filtros e um `resumo` da
@@ -134,6 +136,16 @@ def _estado(conn: Any) -> dict[str, Any]:
     }
 
 
+def _serializar_itens(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Serializa o payload do ERP para o JSON da resposta.
+
+    `data_nota` e `date`, que o FastAPI sabe serializar, mas o `dict` cru nao; aqui
+    fica explicito para o `carga`/`sync` devolverem os itens no proprio corpo e o
+    navegador popular o IndexedDB sem uma segunda leitura da base no Neon.
+    """
+    return [{**item, "data_nota": item["data_nota"].isoformat() if item["data_nota"] else None} for item in payload]
+
+
 def _gravar_estado(
     conn: Any, carga_completa: bool, contagem: int, ultima_data: date | None
 ) -> None:
@@ -177,7 +189,14 @@ def carga_faturamento_detalhe(usuario: _faturamento) -> dict[str, Any]:
         contagem = _contagem(conn)
         ultima_data = _ultima_data(conn)
         _gravar_estado(conn, True, contagem, ultima_data)
-    return {"processados": len(payload), "contagem": contagem, "ultima_data": ultima_data}
+    return {
+        "processados": len(payload),
+        "contagem": contagem,
+        "ultima_data": ultima_data,
+        "janela_inicio": inicio,
+        "janela_fim": fim,
+        "itens": _serializar_itens(payload),
+    }
 
 
 @router.post("/faturamento-detalhe/sync")
@@ -203,7 +222,12 @@ def sync_faturamento_detalhe(usuario: _faturamento) -> dict[str, Any]:
         contagem = _contagem(conn)
         ultima_data = _ultima_data(conn)
         _gravar_estado(conn, True, contagem, ultima_data)
-    return {"processados": len(payload), "contagem": contagem, "ultima_data": ultima_data}
+    return {
+        "processados": len(payload),
+        "contagem": contagem,
+        "ultima_data": ultima_data,
+        "itens": _serializar_itens(payload),
+    }
 
 
 def _inserir(conn: Any, payload: list[dict[str, Any]], *, atualizar: bool = False) -> None:

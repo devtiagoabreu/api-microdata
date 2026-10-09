@@ -171,6 +171,11 @@ class TestCargaESync:
         assert corpo["processados"] == 2
         assert corpo["contagem"] == 2
         assert corpo["ultima_data"] == "2026-10-06"
+        # A carga devolve os itens lidos para o navegador popular o IndexedDB sem reler o Neon.
+        assert len(corpo["itens"]) == 2
+        assert {i["nr_nota"] for i in corpo["itens"]} == {"100", "101"}
+        assert all(isinstance(i["data_nota"], str) for i in corpo["itens"]), "data_nota serializada"
+        assert "janela_inicio" in corpo and "janela_fim" in corpo
         _, params = consultas[0]
         assert params[0] == faturamento_detalhe._inicio_12_meses(date.today())
         assert params[1] == date.today() + timedelta(days=1)
@@ -207,6 +212,10 @@ class TestCargaESync:
         assert corpo["processados"] == 2
         assert corpo["contagem"] == 3
         assert corpo["ultima_data"] == "2026-10-07"
+        # O sync devolve so o delta, para o navegador fazer merge e nao substituir a base.
+        assert len(corpo["itens"]) == 2
+        assert {i["nr_nota"] for i in corpo["itens"]} == {"100", "102"}
+        assert all(isinstance(i["data_nota"], str) for i in corpo["itens"])
         with neon.engine().connect() as conn:
             valor = conn.execute(
                 text(
