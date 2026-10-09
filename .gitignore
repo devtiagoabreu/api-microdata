@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Logs e PID da API (rodar-api.bat / parar-api.bat)
+app/logs/

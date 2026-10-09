@@ -22,10 +22,34 @@ ERP DBMicrodata_DGB ──ETL──▶ Postgres local (raw/core/marts/etl) ─�
 
 ## Rodando
 
+Dá dois cliques (ou `cmd /c`):
+
+```
+rodar-api.bat      sobe a API — ou avisa que já está no ar
+parar-api.bat      derruba
+```
+
+Os dois scripts olham a porta **58245** antes de agir:
+
+| Situação | O que acontece |
+|----------|----------------|
+| Porta livre | Sobe o uvicorn em segundo plano, espera `/health` responder (até 40s) e mostra warehouse + Neon |
+| Já tem instância **da api-microdata** | Mostra o PID e sai — não sobe duas |
+| Porta com **outro programa** | Avisa e **não encosta**; mostra o comando para liberar a porta |
+
+O `HOST` no `rodar-api.bat` é `0.0.0.0` para outra máquina alcançar a API. Se o `dgbcomex` roda
+na mesma máquina e você quiser restringir, troque para `127.0.0.1`. O log fica em
+`app/logs/api.log`.
+
+> A porta **58244** é do `oraculum` legado e **não deve ser tocada** — por isso os scripts são
+> fixos na 58245. Firewall: regra `API-MICRODATA` liberando TCP 58245 em todos os perfis.
+
+Manual, se preferir:
+
 ```powershell
 cd app
 $env:PYTHONPATH='.'
-.\.venv\Scripts\python.exe -m uvicorn src.api.main:app --host 127.0.0.1 --port 58244
+.\.venv\Scripts\python.exe -m uvicorn src.api.main:app --host 0.0.0.0 --port 58245
 ```
 
 17 rotas: `/health`, 2 de auth (`/auth/login`, `/auth/eu`) e 14 de negócio. A auth é **falha fechada**
