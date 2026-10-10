@@ -48,6 +48,8 @@ COLUNAS = (
     "cliente",
     "nome_cliente",
     "cod_produto",
+    "descricao_produto",
+    "unidade_produto",
     "metros",
     "vr_unitario",
     "vr_total",
@@ -65,6 +67,7 @@ SQL_DETALHE = """
 select vf.Empresa as Empresa, vf.Pedido as Pedido, vf.Item as Item, vf.Nr_Nota as Nr_Nota,
   convert(char(10), vf.Data_Nota, 120) as Data_Nota,
   vf.Cliente as Cliente, vf.Nome_Cliente as Nome_Cliente, vf.Cod_Produto as Cod_Produto,
+  cat.Descricao as Descricao_Produto, cat.Unidade as Unidade_Produto,
   vf.Metros as Metros, vf.Vr_Unitario as Vr_Unitario, vf.Vr_Total as Vr_Total,
   vf.Acres_Desc as Acres_Desc, vf.Peso as Peso, vf.Vr_Nota as Vr_Nota,
   fp.Romaneio as Romaneio, vc.Vendedor as Vendedor, rv.Nome_Vendedores as Nome_Vendedores
@@ -77,6 +80,17 @@ left join (
   group by Empresa_NF_Vendedores, Doc_NF_Vendedores
 ) vc on vc.Empresa_NF_Vendedores = vf.Empresa and vc.Doc_NF_Vendedores = vf.Pedido
 left join Rec_Vendedores rv on rv.Codigo_Vendedores = vc.Vendedor
+-- Catalogo de produtos deduplicado por Codigo. `Produtos` tem o mesmo codigo nas
+-- empresas 01 e 13 (mesma descricao), e o faturamento e da empresa 13: casar pelo
+-- par (Empresa, Codigo) nao acha nada. O LEFT JOIN mantem o item sem descricao
+-- quando o produto nao estiver no catalogo, em vez de sumir do detalhe.
+left join (
+  select trim(Codigo) as Codigo,
+         max(trim(Descricao)) as Descricao,
+         max(trim(Unidade)) as Unidade
+  from Produtos
+  group by trim(Codigo)
+) cat on cat.Codigo = trim(vf.Cod_Produto)
 where vf.Data_Nota >= ? and vf.Data_Nota < ?
 """
 
@@ -106,6 +120,9 @@ def _linha_detalhe(linha: dict[str, Any]) -> dict[str, Any]:
         "cliente": texto(_v("Cliente")),
         "nome_cliente": texto(_v("Nome_Cliente")),
         "cod_produto": texto(_v("Cod_Produto")),
+        # Vem do catalogo `Produtos`; None quando o produto nao esta nele.
+        "descricao_produto": texto(_v("Descricao_Produto")),
+        "unidade_produto": texto(_v("Unidade_Produto")),
         "metros": float(_v("Metros") or 0),
         "vr_unitario": float(_v("Vr_Unitario") or 0),
         "vr_total": float(_v("Vr_Total") or 0),
@@ -143,7 +160,10 @@ def _serializar_itens(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
     fica explicito para o `carga`/`sync` devolverem os itens no proprio corpo e o
     navegador popular o IndexedDB sem uma segunda leitura da base no Neon.
     """
-    return [{**item, "data_nota": item["data_nota"].isoformat() if item["data_nota"] else None} for item in payload]
+    return [
+        {**item, "data_nota": item["data_nota"].isoformat() if item["data_nota"] else None}
+        for item in payload
+    ]
 
 
 def _gravar_estado(
@@ -294,7 +314,8 @@ def detalhe_faturamento(
             for linha in conn.execute(
                 text(
                     "select empresa, pedido, item, nr_nota, data_nota, cliente, nome_cliente, "
-                    "cod_produto, metros, vr_unitario, vr_total, acres_desc, peso, vr_nota, "
+                    "cod_produto, descricao_produto, unidade_produto, metros, vr_unitario, "
+                    "vr_total, acres_desc, peso, vr_nota, "
                     "romaneio, representante_codigo, representante "
                     f"from marts.faturamento_detalhe {where} "  # noqa: S608
                     "order by data_nota desc, nr_nota desc, item "

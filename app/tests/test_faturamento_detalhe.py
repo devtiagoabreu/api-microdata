@@ -31,6 +31,8 @@ def _linha(
     representante: str = "REPRESENTACOES A",
     produto: str = "P1",
     cliente: str = "CLI A",
+    descricao: str | None = "VELUDO CONFORT",
+    unidade: str | None = "MT",
 ) -> dict:
     return {
         "Empresa": "13",
@@ -41,6 +43,8 @@ def _linha(
         "Cliente": cliente,
         "Nome_Cliente": cliente,
         "Cod_Produto": produto,
+        "Descricao_Produto": descricao,
+        "Unidade_Produto": unidade,
         "Metros": "100.5",
         "Vr_Unitario": "3.25",
         "Vr_Total": vr_total,
@@ -81,6 +85,20 @@ class TestContrato:
         assert "vwFaturamento" in faturamento_detalhe.SQL_DETALHE
         assert "marts." not in faturamento_detalhe.SQL_DETALHE
 
+    def test_sql_casa_produto_pelo_codigo_deduplicado(self):
+        # O faturamento e da empresa 13 e o catalogo esta nas 01 e 13: casar por
+        # (Empresa, Codigo) nao acha nada. O catalogo precisa vir deduplicado por
+        # Codigo, senao um codigo cadastrado nas duas empresas duplica a linha do item.
+        sql = faturamento_detalhe.SQL_DETALHE
+        assert "group by trim(Codigo)" in sql
+        assert "cat.Codigo = trim(vf.Cod_Produto)" in sql
+        assert "left join" in sql.lower()
+        assert "trim(vf.Cod_Produto) = p.Codigo" not in sql
+
+    def test_produto_sem_catalogo_continua_no_detalhe(self):
+        # LEFT JOIN: produto fora do catalogo fica sem descricao, e nao some.
+        assert "left join (\n  select trim(Codigo)" in faturamento_detalhe.SQL_DETALHE
+
 
 class TestMapa:
     def test_limpa_espacos_e_convert_datas(self):
@@ -96,6 +114,20 @@ class TestMapa:
         assert mapeada["vr_unitario"] == 3.25
         assert mapeada["romaneio"] == "ROM 100"
         assert mapeada["representante"] == "REPRESENTACOES A"
+
+    def test_descricao_do_produto_e_apara(self):
+        linha = _linha()
+        linha["Descricao_Produto"] = "  VELUDO CONFORT   "
+        linha["Unidade_Produto"] = " MT  "
+        mapeada = faturamento_detalhe._linha_detalhe(linha)
+        assert mapeada["descricao_produto"] == "VELUDO CONFORT"
+        assert mapeada["unidade_produto"] == "MT"
+
+    def test_produto_fora_do_catalogo_fica_sem_descricao(self):
+        mapeada = faturamento_detalhe._linha_detalhe(_linha(descricao=None, unidade=None))
+        assert mapeada["descricao_produto"] is None
+        assert mapeada["unidade_produto"] is None
+        assert mapeada["cod_produto"] == "P1"
 
     def test_campos_nulos_viram_zero(self):
         linha = _linha()
@@ -232,12 +264,12 @@ class TestCargaESync:
                 _linha(
                     pedido="0002", nr_nota="101", dia="2026-10-06", vr_total="30",
                     acres_desc="0", representante="REPRESENTACOES B", produto="P2",
-                    cliente="CLI B",
+                    cliente="CLI B", descricao="BELGA", unidade="MT",
                 ),
                 _linha(
                     pedido="0003", nr_nota="102", dia="2026-09-01", vr_total="5",
                     acres_desc="0", vendedor="0003", representante="REPRESENTACOES A",
-                    produto="P1", cliente="CLI A",
+                    produto="P1", cliente="CLI A", descricao="VELUDO CONFORT",
                 ),
             ]
 
@@ -259,6 +291,9 @@ class TestCargaESync:
         assert len(corpo["itens"]) == 3
         assert corpo["itens"][0]["data_nota"] == "2026-10-06"
         assert corpo["itens"][0]["representante"] == "REPRESENTACOES B"
+        # Descricao e unidade do produto viajam na leitura paginada.
+        assert corpo["itens"][0]["descricao_produto"] == "BELGA"
+        assert corpo["itens"][0]["unidade_produto"] == "MT"
 
         so_rep = client.get("/faturamento-detalhe", params={"representante": "B"}).json()
         assert so_rep["resumo"]["itens"] == 1
