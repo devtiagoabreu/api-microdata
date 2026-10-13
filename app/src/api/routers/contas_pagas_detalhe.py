@@ -1,0 +1,237 @@
+"""Detalhe de Contas Pagas: as baixas que somam o valor do card "Contas Pagas".
+
+O card (`kpis.py`, `/contas-pagas/{data}`) soma `vwContasPagas`, que tem **duas**
+colunas: `Data_Baixa` e `valorPago`. Não há fornecedor, documento nem banco ali —
+por isso o card só mostra total. A lista vem da tabela por trás da view,
+`DBMicrodata_DGB.dbo.Pag_Baixas`, que é a mesma que o `SELECT` original (hoje
+comentado) da `uspListagemBaixasPagar` usava.
+
+A reconciliação foi conferida no ERP: `Pag_Baixas` e `vwContasPagas` devolvem as
+mesmas linhas e a mesma soma, com diferença R$ 0,00 em cada um dos 12 meses de
+out/2025 a set/2026. Os joins com `Clientes_Principal` (fornecedor) e `Bancos`
+são 1:1 — nenhum `(Codigo, Tipo)` nem `Nr_Bco_Bancos` duplicado — então não
+duplicam linha nem alteram o total.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends
+
+from src.api.auth.escopos import ESCOPO_FINANCEIRO, exigir_escopo
+from src.api.auth.usuarios import Usuario
+from src.db import erp
+
+router = APIRouter(tags=["contas-pagas-detalhe"])
+
+_financeiro = Annotated[Usuario | None, Depends(exigir_escopo(ESCOPO_FINANCEIRO))]
+
+MESES_BR = (
+    "", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+)
+
+# Série mensal. Começa em 1º/jan de dois anos antes para cobrir `AnoAnterior`
+# (ano inteiro) e ainda dar 24 meses de contexto na tela.
+SQL_SERIE = (
+    "select datefromparts(year(pb.Data_Baixa), month(pb.Data_Baixa), 1) as mes, "
+    "       count(*) as lancamentos, "
+    "       coalesce(sum(isnull(pb.Valor_Pago, 0)), 0) as total "
+    "from DBMicrodata_DGB.dbo.Pag_Baixas pb "
+    "where pb.Data_Baixa >= ? and pb.Data_Baixa < ? "
+    "group by datefromparts(year(pb.Data_Baixa), month(pb.Data_Baixa), 1)"
+)
+
+# Os lançamentos do mês de referência, já com fornecedor e banco.
+# `rtrim` nos char/varchar: o ERP devolve o nome do fornecedor preenchido com
+# espaços até o tamanho do campo.
+SQL_ITENS = """
+select pb.Empresa as Empresa, pb.Documento as Documento,
+       rtrim(pb.Serie) as Serie, pb.Tipo_Fornec as Tipo_Fornec,
+       pb.Fornecedor as Fornecedor, rtrim(pb.Parcela) as Parcela,
+       pb.Parcial as Parcial, pb.Data_Baixa as Data_Baixa,
+       pb.Valor_Pago as Valor_Pago, pb.Juros_Pagos as Juros_Pagos,
+       pb.Desconto_Recebido as Desconto_Recebido, pb.Valor_Liquido as Valor_Liquido,
+       rtrim(pb.Nr_Banco) as Nr_Banco, rtrim(pb.Nr_Cheque) as Nr_Cheque,
+       cp.Razao_Nome_Cliente as Razao_Nome_Cliente,
+       rtrim(b.Nome_Bco_Bancos) as Nome_Bco_Bancos
+from DBMicrodata_DGB.dbo.Pag_Baixas pb
+left join DBMicrodata_DGB.dbo.Clientes_Principal cp
+       on cp.Codigo = pb.Fornecedor and cp.Tipo = pb.Tipo_Fornec
+left join DBMicrodata_DGB.dbo.Bancos b on b.Nr_Bco_Bancos = pb.Nr_Banco
+where pb.Data_Baixa >= ? and pb.Data_Baixa < ?
+order by pb.Data_Baixa desc, pb.Documento
+"""
+
+
+def _texto(valor: Any) -> str:
+    return valor.strip() if isinstance(valor, str) else ""
+
+
+def _numero(valor: Any) -> float:
+    if valor is None or valor == "":
+        return 0.0
+    return float(valor)
+
+
+def _data(valor: Any) -> str | None:
+    if isinstance(valor, datetime):
+        return valor.date().isoformat()
+    if isinstance(valor, date):
+        return valor.isoformat()
+    return None
+
+
+def _primeiro_dia(valor: date) -> date:
+    return valor.replace(day=1)
+
+
+def _proximo_mes(valor: date) -> date:
+    inicio = _primeiro_dia(valor)
+    return date(inicio.year + (inicio.month == 12), inicio.month % 12 + 1, 1)
+
+
+def _somar_meses(base: date, meses: int) -> date:
+    total = base.year * 12 + (base.month - 1) + meses
+    return date(total // 12, total % 12 + 1, 1)
+
+
+def _periodo(rotulo: str, ini: date, fim: date) -> dict[str, Any]:
+    ultimo = date.fromordinal(fim.toordinal() - 1)
+    return {
+        "rotulo": rotulo,
+        "inicio": ini.isoformat(),
+        "fim": ultimo.isoformat(),
+        "periodo": f"{ini:%d/%m/%Y} a {ultimo:%d/%m/%Y}",
+    }
+
+
+def _janelas(referencia: date) -> dict[str, tuple[date, date]]:
+    """As mesmas 4 janelas de `_janelas_4` em `kpis.py`, com o fim exclusivo."""
+    inicio_mes = _primeiro_dia(referencia)
+    fim_mes = _proximo_mes(inicio_mes)
+    return {
+        "mes": (inicio_mes, fim_mes),
+        "mes_anterior": (_somar_meses(inicio_mes, -1), inicio_mes),
+        "ano_atual": (date(referencia.year, 1, 1), fim_mes),
+        "ano_anterior": (date(referencia.year - 1, 1, 1), date(referencia.year, 1, 1)),
+    }
+
+
+def _item(linha: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "empresa": _texto(linha.get("Empresa")),
+        "documento": _texto(linha.get("Documento")),
+        "serie": _texto(linha.get("Serie")),
+        "fornecedor": _texto(linha.get("Fornecedor")),
+        "razao_social": _texto(linha.get("Razao_Nome_Cliente")),
+        "tipo_fornecedor": _texto(linha.get("Tipo_Fornec")),
+        "parcela": _texto(linha.get("Parcela")),
+        "parcial": _texto(linha.get("Parcial")),
+        "data_baixa": _data(linha.get("Data_Baixa")),
+        "banco": _texto(linha.get("Nome_Bco_Bancos")),
+        "numero_banco": _texto(linha.get("Nr_Banco")),
+        "cheque": _texto(linha.get("Nr_Cheque")),
+        # Sem `abs()`: o card soma `Valor_Pago` com o sinal que vier. Não há
+        # pagamento negativo em 2024-2026 (conferido no ERP), e normalizar aqui
+        # abriria uma divergência de reconciliação sem causa.
+        "valor": _numero(linha.get("Valor_Pago")),
+        "juros": _numero(linha.get("Juros_Pagos")),
+        "desconto": _numero(linha.get("Desconto_Recebido")),
+        "valor_liquido": _numero(linha.get("Valor_Liquido")),
+    }
+
+
+def _agrupar(itens: list[dict[str, Any]], chave: str) -> list[dict[str, Any]]:
+    mapa: dict[str, dict[str, Any]] = {}
+    for item in itens:
+        rotulo = item.get(chave) or "—"
+        atual = mapa.setdefault(rotulo, {chave: rotulo, "lancamentos": 0, "valor": 0.0})
+        atual["lancamentos"] += 1
+        atual["valor"] += item["valor"]
+    return sorted(mapa.values(), key=lambda g: -g["valor"])
+
+
+@router.get("/contas-pagas-detalhe")
+def contas_pagas_detalhe(
+    usuario: _financeiro, data: date | None = None
+) -> dict[str, Any]:
+    """As baixas de contas pagas do mês de referência e as 4 janelas do card.
+
+    `data` (opcional, padrão hoje) ancla o mês: o card compara esse mês com o
+    anterior, o acumulado do ano e o ano anterior.
+
+    Os lançamentos vêm só do mês de referência (o que a tela lista); as outras
+    três janelas entram como total e contagem, que é tudo que o card mostra.
+    """
+    referencia = data or date.today()
+    janelas = _janelas(referencia)
+    inicio, fim = janelas["mes"]
+
+    inicio_serie = date(referencia.year - 2, 1, 1)
+    mensal: dict[tuple[int, int], dict[str, Any]] = {}
+    for linha in erp.query(SQL_SERIE, (inicio_serie, fim)):
+        mes = linha["mes"]
+        mensal[(mes.year, mes.month)] = {
+            "total": float(linha["total"] or 0),
+            "lancamentos": int(linha["lancamentos"] or 0),
+        }
+
+    def bloco(nome: str, rotulo: str) -> dict[str, Any]:
+        ini, f = janelas[nome]
+        valores = [
+            dados
+            for (ano, m), dados in mensal.items()
+            if ini <= date(ano, m, 1) < f
+        ]
+        return {
+            **_periodo(rotulo, ini, f),
+            "total": sum(d["total"] for d in valores),
+            "lancamentos": sum(d["lancamentos"] for d in valores),
+        }
+
+    itens = [_item(linha) for linha in erp.query(SQL_ITENS, (inicio, fim))]
+    total_mes = sum(item["valor"] for item in itens)
+
+    # 24 meses terminando na referência, para dar contexto às 4 janelas.
+    meses = []
+    for passo in range(-23, 1):
+        chave = _primeiro_dia(_somar_meses(inicio, passo))
+        dados = mensal.get((chave.year, chave.month), {"total": 0.0, "lancamentos": 0})
+        meses.append(
+            {
+                "mes": f"{chave.year}-{chave.month:02d}",
+                "rotulo": f"{MESES_BR[chave.month][:3]}/{chave.year}",
+                "total": dados["total"],
+                "lancamentos": dados["lancamentos"],
+            }
+        )
+
+    return {
+        "referencia": {
+            **_periodo(
+                MESES_BR[inicio.month],
+                inicio,
+                _proximo_mes(inicio),
+            ),
+            "mes": f"{inicio.year}-{inicio.month:02d}",
+        },
+        "mes": {
+            **_periodo(MESES_BR[inicio.month], inicio, _proximo_mes(inicio)),
+            "total": total_mes,
+            "lancamentos": len(itens),
+            "itens": itens,
+            "por_fornecedor": _agrupar(itens, "razao_social"),
+            "por_banco": _agrupar(itens, "banco"),
+            "por_empresa": _agrupar(itens, "empresa"),
+        },
+        "mes_anterior": bloco("mes_anterior", "Mês anterior"),
+        "ano_atual": bloco("ano_atual", "Ano atual"),
+        "ano_anterior": bloco("ano_anterior", "Ano anterior"),
+        "meses": meses,
+    }
+
+
+__all__ = ["router"]
