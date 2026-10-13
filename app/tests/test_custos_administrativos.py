@@ -187,3 +187,186 @@ class TestResposta:
         assert item["razao_social"] == "FOLHA DE PAGAMENTO"
         assert item["data_baixa"] == "2026-09-16"
         assert item["departamento"] == "1.1.1.2"
+
+
+def _linha_mes(
+    mes: str,
+    documento: str = "016U",
+    valor: str = "100",
+    razao: str = "FOLHA DE PAGAMENTO",
+    despesa: str = "FIXOS",
+    dpto_nome: str = "ADM SBO",
+    dpto4: int = 2,
+) -> dict:
+    return _linha(
+        documento=documento,
+        razao=razao,
+        despesa=despesa,
+        dpto_nome=dpto_nome,
+        dpto4=dpto4,
+        valor=valor,
+        baixa=f"{mes}-10",
+    )
+
+
+# Os 12 meses fechados de uma referência em outubro/2026.
+MESES_FECHADOS = [
+    "2025-10", "2025-11", "2025-12",
+    "2026-01", "2026-02", "2026-03", "2026-04",
+    "2026-05", "2026-06", "2026-07", "2026-08", "2026-09",
+]
+
+
+@pytest.fixture
+def anual(monkeypatch):
+    """Duas fontes distintas: itens do rateio e faturamento mês a mês."""
+
+    def montar(itens, faturamento):
+        monkeypatch.setattr(
+            detalhe.erp, "ultimo_resultado", lambda sql, params=(): list(itens)
+        )
+        monkeypatch.setattr(
+            detalhe.erp,
+            "query",
+            lambda sql, params=(): [
+                {"Mes": mes, "Faturamento": Decimal(str(valor))}
+                for mes, valor in faturamento.items()
+            ],
+        )
+
+    return montar
+
+
+class TestJanela12Meses:
+    def test_pegam_o_mes_de_referencia_menos_doze_ate_o_anterior(self):
+        inicio, fim = detalhe._janela_12_meses(date(2026, 10, 13))
+        assert inicio == date(2025, 10, 1)
+        assert fim == date(2026, 9, 30)
+
+    def test_somar_meses_atravessa_a_virada_de_ano(self):
+        assert detalhe._somar_meses(date(2025, 10, 1), 3) == date(2026, 1, 1)
+        assert detalhe._somar_meses(date(2025, 11, 1), 2) == date(2026, 1, 1)
+
+    def test_rotulo_do_mes_em_portugues(self):
+        assert detalhe._mes_rotulo("2025-10") == "out/2025"
+        assert detalhe._mes_rotulo("2026-01") == "jan/2026"
+
+
+class TestDetalheAnual:
+    def test_serie_tem_doze_meses_ordenados_e_o_rotulo_da_janela(self, anual):
+        anual([], {})
+        corpo = client.get(
+            "/custos-administrativos-anual-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        assert len(corpo["meses"]) == 12
+        assert [m["mes"] for m in corpo["meses"]][0] == "2025-10"
+        assert [m["mes"] for m in corpo["meses"]][-1] == "2026-09"
+        assert corpo["janela"]["rotulo"] == "out/2025 a set/2026"
+        assert corpo["janela"]["meses"] == 12
+
+    def test_mes_sem_lancamento_vai_com_zero_e_nao_some_da_serie(self, anual):
+        anual([_linha_mes("2026-09")], {})
+        corpo = client.get(
+            "/custos-administrativos-anual-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        zeros = [m for m in corpo["meses"] if m["administrativo"] == 0]
+        assert len(zeros) == 11
+        setembro = [m for m in corpo["meses"] if m["mes"] == "2026-09"][0]
+        assert setembro["administrativo"] == 100
+        assert setembro["lancamentos"] == 1
+
+    def test_total_e_media_sao_o_card_anual(self, anual):
+        # 12 meses de R$ 100 = R$ 1.200 no total e R$ 100 de média.
+        anual([_linha_mes(mes) for mes in MESES_FECHADOS], {})
+        corpo = client.get(
+            "/custos-administrativos-anual-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        assert len(corpo["itens"]) == 12
+        assert round(corpo["administrativo"]["total"], 2) == 1200.0
+        assert round(corpo["administrativo"]["media"], 2) == 100.0
+        assert corpo["administrativo"]["lancamentos"] == 12
+
+    def test_faturamento_vem_da_mesma_conta_da_procedure(self, anual):
+        anual([], {m: 1000 for m in ("2025-10", "2026-09")})
+        corpo = client.get(
+            "/custos-administrativos-anual-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        assert round(corpo["faturamento"]["total"], 2) == 2000.0
+        assert corpo["faturamento"]["media"] == pytest.approx(2000.0 / 12)
+        # Só os 2 meses com faturamento entram na soma.
+        assert [m["faturamento"] for m in corpo["meses"] if m["faturamento"]] == [1000.0, 1000.0]
+
+    def test_porcentagem_do_mes_e_do_periodo(self, anual):
+        anual(
+            [_linha_mes("2026-09", valor="250")],
+            {"2026-09": 1000, "2025-10": 3000},
+        )
+        corpo = client.get(
+            "/custos-administrativos-anual-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        setembro = [m for m in corpo["meses"] if m["mes"] == "2026-09"][0]
+        assert round(setembro["porcentagem"], 4) == 0.25
+        # Total 250 sobre 4000 de faturamento.
+        assert round(corpo["faturamento"]["porcentagem"], 4) == 0.0625
+
+    def test_porcentagem_vem_nulo_quando_nao_houve_faturamento(self, anual):
+        anual([_linha_mes("2026-09")], {})
+        corpo = client.get(
+            "/custos-administrativos-anual-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        assert corpo["faturamento"]["porcentagem"] is None
+        assert [m for m in corpo["meses"] if m["mes"] == "2026-09"][0]["porcentagem"] is None
+
+    def test_item_carrega_o_mes_para_o_filtro_da_tela(self, anual):
+        anual([_linha_mes("2025-11", documento="DOC-NOV")], {})
+        corpo = client.get(
+            "/custos-administrativos-anual-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        assert corpo["itens"][0]["mes"] == "2025-11"
+        assert corpo["itens"][0]["documento"] == "DOC-NOV"
+
+    def test_agrupamentos_somam_o_periodo_inteiro(self, anual):
+        anual(
+            [
+                _linha_mes("2025-10", valor="100", despesa="FIXOS", razao="FOLHA"),
+                _linha_mes("2026-09", valor="50", despesa="FIXOS", razao="FOLHA"),
+                _linha_mes("2026-09", valor="25", despesa="VARIÁVEIS", razao="TELEFONICA"),
+            ],
+            {},
+        )
+        corpo = client.get(
+            "/custos-administrativos-anual-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        assert corpo["por_despesa"][0] == {"despesa": "FIXOS", "lancamentos": 2, "valor": 150.0}
+        assert corpo["por_fornecedor"][0]["razao_social"] == "FOLHA"
+        assert round(sum(g["valor"] for g in corpo["por_departamento"]), 2) == 175.0
+
+    def test_so_aceita_departamentos_administrativos(self, anual):
+        anual(
+            [
+                _linha_mes("2026-09", documento="DENTRO"),
+                _linha_mes("2026-09", documento="FORA", dpto4=5, dpto_nome="PRODUCAO"),
+            ],
+            {},
+        )
+        corpo = client.get(
+            "/custos-administrativos-anual-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        # O filtro roda em `_buscar`, sobre os códigos 1.1.1.1/1.1.1.2.
+        assert [i["documento"] for i in corpo["itens"]] == ["DENTRO"]
+        assert round(corpo["administrativo"]["total"], 2) == 100.0
+
+    def test_usa_a_whitelist_read_only(self, anual):
+        from src.db.erp import assert_read_only
+
+        assert_read_only(detalhe.SQL_DETALHE)
+        assert_read_only(detalhe.SQL_FATURAMENTO_MENSAL)
