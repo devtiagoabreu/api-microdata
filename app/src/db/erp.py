@@ -15,8 +15,10 @@ _ALLOWED_PREFIXES = ("select", "with")
 _WHITESPACE = re.compile(r"\s+")
 # Nomes comparados em minúsculas: o SQL Server é case-insensitive por padrão e o nome pode
 # vir como `uspFaturamento`, `DBProDash.dbo.uspFaturamento` ou `[DBProDash].[dbo].[uspFaturamento]`.
-# Só entram aqui as procedures que apenas leem: as `uspRel_CCusto_Niveis*` e a
-# `sp_PagRel_CCusto_Niveis` **escrevem** (`TRUNCATE + INSERT`) e por isso ficam de fora.
+# Só entram aqui as procedures que apenas leem. `sp_PagRel_CCusto_Niveis` foi verificada
+# linha a linha: todas as suas escritas vão para tabelas temporárias (#DespRec, #DespRec1,
+# #Dpto, #Rel_CCusto_Niveis) e não há TRUNCATE, DELETE nem MERGE em objeto real — o corpo
+# inteiro só monta resultado em memória e devolve com um `Exec('Select ...')` final.
 PROCEDURES_SOMENTE_LEITURA = frozenset(
     nome.lower()
     for nome in (
@@ -32,6 +34,7 @@ PROCEDURES_SOMENTE_LEITURA = frozenset(
         "uspFaturamento",
         "uspFaturamentoDia",
         "uspListagemBaixasPagar",
+        "sp_pagrel_ccusto_niveis",
     )
 )
 
@@ -118,3 +121,27 @@ def scalar(sql: str, params: Sequence[Any] | str | None = None) -> Any:
     if not rows:
         return None
     return next(iter(rows[0].values()))
+
+
+def ultimo_resultado(sql: str, params: Sequence[Any] | str | None = None) -> list[dict[str, Any]]:
+    """Lê o **último** result set que a procedure emitir.
+
+    `query` usa só `cursor.fetchall()` do primeiro conjunto, que é `None` em
+    procedure que monta o resultado em tabelas temporárias. `sp_PagRel_CCusto_Niveis`
+    emite 9 conjuntos e só o último traz o relatório; sem percorrer com `nextset()`
+    a chamada volta vazia.
+    """
+    assert_read_only(sql)
+    with connect(read_only=True) as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql, _params(params))
+        linhas: list[dict[str, Any]] = []
+        while True:
+            if cursor.description is not None:
+                cols = [str(col[0]).strip() for col in cursor.description]
+                linhas = [
+                    dict(zip(cols, row, strict=True)) for row in cursor.fetchall()
+                ]
+            if not cursor.nextset():
+                break
+        return linhas

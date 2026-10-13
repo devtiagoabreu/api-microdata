@@ -234,7 +234,6 @@ class TestGuardDeProcedureNoERP:
             "update x set y = 1",
             "delete from x",
             "exec DBProDash.dbo.uspAtualizaPreco",
-            "exec DBProDash.dbo.sp_PagRel_CCusto_Niveis",
             "exec @proc",
             "EXEC sp_executesql 'select 1'",
             "exec DBProDash.dbo.uspFaturamento; drop table x",
@@ -246,13 +245,25 @@ class TestGuardDeProcedureNoERP:
             erp.assert_read_only(sql)
 
     def test_procedure_que_escreve_nao_entra(self):
-        """As `uspRel_CCusto_Niveis*` e a `sp_PagRel_CCusto_Niveis` fazem TRUNCATE+INSERT."""
+        """As `uspRel_CCusto_Niveis*` fazem TRUNCATE+INSERT e ficam de fora."""
         for nome in (
             "usprel_ccusto_niveisanual",
             "usprel_ccusto_niveismensal",
-            "sp_pagrel_ccusto_niveis",
         ):
             assert nome not in erp.PROCEDURES_SOMENTE_LEITURA, nome
+
+    def test_sp_pagrel_ccusto_niveis_entra_por_nao_escrever_em_objeto_real(self):
+        """A `sp_PagRel_CCusto_Niveis` foi auditada e é read-only no que importa.
+
+        O comentário antigo dizia que ela escrevia (`TRUNCATE + INSERT`) e por isso
+        ficava fora. A varredura do corpo mostrou o contrário: zero `TRUNCATE`, zero
+        `DELETE`, zero `MERGE`, e todas as escritas (`insert into`, `update`) vão para
+        tabelas temporárias da sessão — `#DespRec`, `#DespRec1`, `#Dpto` e
+        `#Rel_CCusto_Niveis`. O resultado sai num `Exec('Select ...')` final, que é o
+        que a rota de detalhe consome via `erp.ultimo_resultado`.
+        """
+        assert "sp_pagrel_ccusto_niveis" in erp.PROCEDURES_SOMENTE_LEITURA
+        erp.assert_read_only("exec DBProDash.dbo.sp_PagRel_CCusto_Niveis ?, ?, 'B'")
 
     def test_nomes_da_whitelist_sao_case_insensitive(self):
         assert "uspfaturamento" in erp.PROCEDURES_SOMENTE_LEITURA

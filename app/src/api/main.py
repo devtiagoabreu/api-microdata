@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api.routers import auth, estoque, faturamento_detalhe, infra, kpis
+from src.api.routers import auth, custos_administrativos, estoque, faturamento_detalhe, infra, kpis
 from src.config import get_settings
 
 settings = get_settings()
@@ -31,3 +31,4 @@ app.include_router(auth.router)
 app.include_router(estoque.router)
 app.include_router(kpis.router)
 app.include_router(faturamento_detalhe.router)
+app.include_router(custos_administrativos.router)
