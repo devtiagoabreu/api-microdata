@@ -225,6 +225,97 @@ class TestCargaESync:
         monkeypatch.setattr(faturamento_detalhe.erp, "query", consulta)
         assert client.post("/faturamento-detalhe/sync").status_code == 409
 
+    def test_operacao_recente_e_pulada_sem_ler_o_erp(self, monkeypatch):
+        # Duas telas abertas juntas decidem a mesma coisa: a segunda nao deve reler 12 meses
+        # do ERP nem reescrever o Neon. A resposta vem 200 com `pulado`, para nao virar erro.
+        def consulta(sql, params=()):
+            return [_linha()]
+
+        monkeypatch.setattr(faturamento_detalhe.erp, "query", consulta)
+        client.post("/faturamento-detalhe/carga")
+
+        lidas: list[str] = []
+
+        def contando(sql, params=()):
+            lidas.append(sql)
+            return consulta(sql, params)
+
+        monkeypatch.setattr(faturamento_detalhe.erp, "query", contando)
+
+        for rota in ("/faturamento-detalhe/carga", "/faturamento-detalhe/sync"):
+            corpo = client.post(rota).json()
+            assert corpo["pulado"] is True, rota
+            assert corpo["itens"] == []
+            assert corpo["contagem"] == 1, "devolve a contagem que ja esta no Neon"
+            assert "atualizada" in corpo["motivo"], corpo["motivo"]
+        # Nenhuma releitura do ERP: era esse o custo que se queria evitar.
+        assert lidas == []
+        # A base continua intacta.
+        estado = client.get("/faturamento-detalhe/estado").json()
+        assert estado["contagem"] == 1
+
+    def test_forcar_ignora_o_corte_de_recencia(self, monkeypatch):
+        def consulta(sql, params=()):
+            return [_linha()]
+
+        monkeypatch.setattr(faturamento_detalhe.erp, "query", consulta)
+        client.post("/faturamento-detalhe/carga")
+
+        # Botão manual do usuário: manda refazer, faz.
+        assert client.post("/faturamento-detalhe/carga?forcar=true").json()["pulado"] is False
+        assert client.post("/faturamento-detalhe/sync?forcar=true").json()["pulado"] is False
+
+    def test_base_antiga_nao_e_pulada(self, monkeypatch):
+        # Passou da janela de recencia, a operacao volta a acontecer sozinha.
+        def consulta(sql, params=()):
+            return [_linha()]
+
+        monkeypatch.setattr(faturamento_detalhe.erp, "query", consulta)
+        client.post("/faturamento-detalhe/carga")
+
+        with neon.engine().begin() as conn:
+            conn.execute(
+                text(
+                    "update marts.faturamento_detalhe_estado set "
+                    "atualizado_em = now() - make_interval(mins => :minutos) where id = 1"
+                ),
+                {"minutos": faturamento_detalhe.JANELA_REPETICAO_MIN + 1},
+            )
+
+        corpo = client.post("/faturamento-detalhe/carga").json()
+        assert corpo.get("pulado") is False
+        assert corpo["processados"] == 1
+
+    def test_estado_devolve_quando_foi_mexido(self, monkeypatch):
+        def consulta(sql, params=()):
+            return [_linha()]
+
+        monkeypatch.setattr(faturamento_detalhe.erp, "query", consulta)
+        client.post("/faturamento-detalhe/carga")
+
+        estado = client.get("/faturamento-detalhe/estado").json()
+        assert estado["atualizado_em"], "o front mostra ha quanto tempo a base foi mexida"
+
+    def test_pulado_nao_roda_sem_carga_completa(self, monkeypatch):
+        # Base zerada e `atualizado_em` recente nao podem pular: ai nao ha o que ler.
+        def consulta(sql, params=()):
+            return [_linha()]
+
+        monkeypatch.setattr(faturamento_detalhe.erp, "query", consulta)
+        client.post("/faturamento-detalhe/carga")
+        _limpar_base()
+        with neon.engine().begin() as conn:
+            conn.execute(
+                text(
+                    "update marts.faturamento_detalhe_estado set "
+                    "carga_completa = true where id = 1"
+                )
+            )
+            conn.execute(text("delete from marts.faturamento_detalhe"))
+
+        corpo = client.post("/faturamento-detalhe/carga").json()
+        assert corpo.get("pulado") is False
+
     def test_sync_traz_o_delta_e_nao_duplica(self, monkeypatch):
         def consulta(sql, params=()):
             return [_linha(), _linha(pedido="0002", nr_nota="101", dia="2026-10-06")]
@@ -240,7 +331,9 @@ class TestCargaESync:
             ]
 
         monkeypatch.setattr(faturamento_detalhe.erp, "query", delta)
-        corpo = client.post("/faturamento-detalhe/sync").json()
+        # `forcar`: sem ele o sync cai no corte de recencia da carga feita acima, que e
+        # exatamente o par redundante que o corte existe para barrar.
+        corpo = client.post("/faturamento-detalhe/sync?forcar=true").json()
         assert corpo["processados"] == 2
         assert corpo["contagem"] == 3
         assert corpo["ultima_data"] == "2026-10-07"

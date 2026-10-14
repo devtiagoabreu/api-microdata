@@ -25,7 +25,7 @@ Todas as rotas exigem o escopo `faturamento:leitura`, o mesmo dos cards de fatur
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -38,6 +38,13 @@ from src.db import erp, neon
 router = APIRouter(tags=["faturamento-detalhe"])
 
 _faturamento = Annotated[Usuario | None, Depends(exigir_escopo(ESCOPO_FATURAMENTO))]
+
+# Duas telas abertas ao mesmo tempo decidem a mesma coisa e chamam `carga`/`sync` juntas.
+# Cada uma dessas chamadas relê 12 meses do ERP e reescreve o Neon, entao a segunda nao
+# traz nada de novo. Como o navegador decide sozinho quem carrega, o limite fica aqui:
+# quem chega ate `JANELA_REPETICAO_MIN` minutos da ultima operacao ganha um "pulado" e
+# vai buscar os itens no dump. O botao manual manda `forcar=true` e sempre executa.
+JANELA_REPETICAO_MIN = 30
 
 COLUNAS = (
     "empresa",
@@ -145,11 +152,55 @@ def _estado(conn: Any) -> dict[str, Any]:
              "from marts.faturamento_detalhe_estado where id = 1")
     ).mappings().first()
     if linha is None:
-        return {"carga_completa": False, "contagem": 0, "ultima_data": None}
+        return {
+            "carga_completa": False,
+            "contagem": 0,
+            "ultima_data": None,
+            "atualizado_em": None,
+        }
     return {
         "carga_completa": bool(linha["carga_completa"]),
         "contagem": int(linha["contagem"] or 0),
         "ultima_data": linha["ultima_data"],
+        "atualizado_em": linha["atualizado_em"],
+    }
+
+
+def _minutos_desde(atualizado_em: datetime | None) -> float | None:
+    if atualizado_em is None:
+        return None
+    # `atualizado_em` e timestamptz; o psycopg devolve com fuso, mas sem fuso se o
+    # servidor estiver em UTC sem configuracao — normaliza para nao explodir no sub.
+    momento = atualizado_em if atualizado_em.tzinfo else atualizado_em.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - momento).total_seconds() / 60
+
+
+def _motivo_pular(estado: dict[str, Any], forcar: bool) -> str | None:
+    """Motivo para nao repetir a operacao agora, ou `None` para executar.
+
+    `forcar=True` e o botao manual do usuario: ele mandou refazer, faz.
+    """
+    if forcar or not estado["carga_completa"] or not estado["contagem"]:
+        return None
+    minutos = _minutos_desde(estado.get("atualizado_em"))
+    if minutos is None or minutos >= JANELA_REPETICAO_MIN:
+        return None
+    quando = max(int(minutos), 1)
+    return (
+        f"a base foi atualizada {quando} min{'s' if quando > 1 else ''} atras por outra sessao; "
+        "use os itens que ja estao no Neon"
+    )
+
+
+def _pulado(estado: dict[str, Any], motivo: str) -> dict[str, Any]:
+    """Resposta de quem nao repetiu o trabalho: 200 com a base atual, sem erro na tela."""
+    return {
+        "pulado": True,
+        "motivo": motivo,
+        "processados": 0,
+        "contagem": estado["contagem"],
+        "ultima_data": estado["ultima_data"],
+        "itens": [],
     }
 
 
@@ -195,13 +246,28 @@ def estado_faturamento_detalhe(usuario: _faturamento) -> dict[str, Any]:
     inicio, fim = _janela()
     with neon.engine().connect() as conn:
         estado = _estado(conn)
-    return {**estado, "janela_inicio": inicio.isoformat(), "janela_fim": fim.isoformat()}
+    return {
+        **estado,
+        "atualizado_em": estado["atualizado_em"].isoformat() if estado["atualizado_em"] else None,
+        "janela_inicio": inicio.isoformat(),
+        "janela_fim": fim.isoformat(),
+    }
 
 
 @router.post("/faturamento-detalhe/carga")
-def carga_faturamento_detalhe(usuario: _faturamento) -> dict[str, Any]:
-    """(Re)constrói a base de 12 meses: le o ERP ao vivo e substitui o Neon."""
+def carga_faturamento_detalhe(usuario: _faturamento, forcar: bool = False) -> dict[str, Any]:
+    """(Re)constrói a base de 12 meses: le o ERP ao vivo e substitui o Neon.
+
+    Sem `forcar` e com a base mexida nos ultimos `JANELA_REPETICAO_MIN` minutos,
+    devolve `pulado` sem ler o ERP: outra sessao acabou de fazer esse trabalho.
+    """
     inicio, fim = _janela()
+    with neon.engine().connect() as conn:
+        estado = _estado(conn)
+    motivo = _motivo_pular(estado, forcar)
+    if motivo:
+        return {**_pulado(estado, motivo), "janela_inicio": inicio, "janela_fim": fim}
+
     payload = _ler_erp(inicio, fim + timedelta(days=1))
     with neon.engine().begin() as conn:
         conn.execute(text("delete from marts.faturamento_detalhe"))
@@ -210,6 +276,7 @@ def carga_faturamento_detalhe(usuario: _faturamento) -> dict[str, Any]:
         ultima_data = _ultima_data(conn)
         _gravar_estado(conn, True, contagem, ultima_data)
     return {
+        "pulado": False,
         "processados": len(payload),
         "contagem": contagem,
         "ultima_data": ultima_data,
@@ -220,16 +287,20 @@ def carga_faturamento_detalhe(usuario: _faturamento) -> dict[str, Any]:
 
 
 @router.post("/faturamento-detalhe/sync")
-def sync_faturamento_detalhe(usuario: _faturamento) -> dict[str, Any]:
+def sync_faturamento_detalhe(usuario: _faturamento, forcar: bool = False) -> dict[str, Any]:
     """Delta: le so notas com `Data_Nota >= ultima_data`, faz upsert e atualiza o estado.
 
     Rejeita com 409 se ainda nao houve carga (`carga_completa = false`): sem watermark nao
-    da para saber onde comeca o que e novo.
+    da para saber onde comeca o que e novo. Sem `forcar`, repete o mesmo corte de
+    recencia da carga e devolve `pulado`.
     """
     with neon.engine().connect() as conn:
         estado = _estado(conn)
     if not estado["carga_completa"]:
         raise HTTPException(status_code=409, detail="carga inicial ainda nao feita")
+    motivo = _motivo_pular(estado, forcar)
+    if motivo:
+        return _pulado(estado, motivo)
     inicio = estado["ultima_data"] or _inicio_12_meses(date.today())
     _, fim = _janela()
     payload = _ler_erp(inicio, fim + timedelta(days=1))
@@ -243,6 +314,7 @@ def sync_faturamento_detalhe(usuario: _faturamento) -> dict[str, Any]:
         ultima_data = _ultima_data(conn)
         _gravar_estado(conn, True, contagem, ultima_data)
     return {
+        "pulado": False,
         "processados": len(payload),
         "contagem": contagem,
         "ultima_data": ultima_data,
