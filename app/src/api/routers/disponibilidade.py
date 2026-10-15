@@ -109,8 +109,11 @@ def _texto(valor: Any) -> str:
 
 
 # Os pedidos de venda linha a linha, para o detalhe da cor: a rota principal volta
-# agregado por representante; aqui vem o codigo, o cliente e as datas. `Cliente` da
-# view e o CNPJ — o nome vem do cadastro.
+# agregado por representante; aqui vem o codigo, o cliente e as datas.
+#
+# `Cliente` da view e o **CNPJ** (mesmo dominio `Cliente` de `Car_Pedido.Cliente`), e o
+# nome esta em `Clientes_Principal.Codigo_Cliente` — casar por `Codigo` nao acha nada,
+# porque aquele e o codigo curto ('00001').
 SQL_PEDIDOS = """
 select rtrim(q.Empresa) as empresa,
        rtrim(q.Pedido) as pedido,
@@ -131,7 +134,7 @@ from DBMicrodata_DGB.dbo.Vw_Saldo_Pedido_Carteira_Qlik q
 left join DBMicrodata_DGB.dbo.Rec_Vendedores v
   on v.Codigo_Vendedores = rtrim(q.Vendedor)
 left join DBMicrodata_DGB.dbo.Clientes_Principal cp
-  on cp.Codigo = rtrim(q.Cliente)
+  on cp.Codigo_Cliente = q.Cliente
 where 1 = 1
 {onde}
 order by q.Data_Pedido desc, q.Pedido desc
