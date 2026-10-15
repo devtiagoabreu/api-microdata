@@ -280,6 +280,95 @@ class TestRegra:
         assert resumo["produtos_cor"] == 2
 
 
+class TestPedidos:
+    def pedido(self, over=None) -> dict:
+        base = {
+            "empresa": "13",
+            "pedido": "00006862",
+            "cliente": "07.920.906/0001-73",
+            "cliente_nome": "TECIDOS ABC",
+            "vendedor": "055",
+            "vendedor_nome": "ANA SOUZA",
+            "produto": "000014",
+            "cor": "00005",
+            "data_pedido": date(2026, 10, 14),
+            "data_entrega": date(2026, 11, 17),
+            "qtde_pedido": 1_843.2,
+            "qtde_romaneada": 0.0,
+            "saldo": 1_843.2,
+            "valor": 12_165.12,
+            "status": "Analise Financeira",
+        }
+        return {**base, **(over or {})}
+
+    def _mock(self, linhas, monkeypatch):
+        def consultar(sql, filtros):
+            assert sql is disponibilidade.SQL_PEDIDOS
+            return linhas
+
+        monkeypatch.setattr(disponibilidade, "_consultar_erp", consultar)
+
+    def test_devolve_o_codigo_do_pedido_e_o_cliente(self, monkeypatch):
+        self._mock([self.pedido()], monkeypatch)
+
+        corpo = client.get("/estoque-disponibilidade/pedidos?produto=000014&cor=00005").json()
+
+        assert corpo["total"] == 1
+        pedido = corpo["pedidos"][0]
+        # o que a tela nao tinha: o codigo do pedido
+        assert pedido["pedido"] == "00006862"
+        assert pedido["cliente_nome"] == "TECIDOS ABC"
+        assert pedido["vendedor_nome"] == "ANA SOUZA"
+        assert pedido["saldo"] == 1_843.2
+        assert pedido["data_entrega"] == "2026-11-17"
+        assert corpo["valor"] == 12_165.12
+
+    def test_ignora_item_sem_saldo(self, monkeypatch):
+        # Item ja romaneado nao promete nada: nao entra na conversa de cobranca.
+        self._mock([self.pedido(), self.pedido({"pedido": "00006863", "saldo": 0.0})], monkeypatch)
+
+        corpo = client.get("/estoque-disponibilidade/pedidos").json()
+
+        assert corpo["total"] == 1
+        assert corpo["pedidos"][0]["pedido"] == "00006862"
+
+    def test_ordena_do_pedido_mais_recente(self, monkeypatch):
+        self._mock(
+            [
+                self.pedido({"pedido": "00006862", "data_pedido": date(2026, 10, 1)}),
+                self.pedido({"pedido": "00006899", "data_pedido": date(2026, 10, 14)}),
+            ],
+            monkeypatch,
+        )
+
+        pedidos = client.get("/estoque-disponibilidade/pedidos").json()["pedidos"]
+
+        assert [p["pedido"] for p in pedidos] == ["00006899", "00006862"]
+
+    def test_filtros_viram_parametros(self, monkeypatch):
+        vistos: list = []
+
+        def consultar(sql, filtros):
+            vistos.extend(filtros)
+            return []
+
+        monkeypatch.setattr(disponibilidade, "_consultar_erp", consultar)
+        monkeypatch.setattr(disponibilidade, "empresa_efetiva", lambda usuario, pedida: "13")
+
+        client.get("/estoque-disponibilidade/pedidos?produto=000014&cor=00005")
+
+        assert vistos == [
+            ("q.Empresa = ?", "13"),
+            ("rtrim(q.Produto) = ?", "000014"),
+            ("rtrim(q.Cor) = ?", "00005"),
+        ]
+
+    def test_sql_dos_pedidos_e_somente_leitura(self):
+        assert "Vw_Saldo_Pedido_Carteira_Qlik" in disponibilidade.SQL_PEDIDOS
+        assert "Clientes_Principal" in disponibilidade.SQL_PEDIDOS
+        erp.assert_read_only(disponibilidade.SQL_PEDIDOS.replace("{onde}", ""))
+
+
 class TestContrato:
     def test_rota_publicada(self):
         assert "/estoque-disponibilidade" in app.openapi()["paths"]

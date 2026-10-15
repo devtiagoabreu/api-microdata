@@ -108,6 +108,36 @@ def _texto(valor: Any) -> str:
     return str(valor).strip() if valor is not None else ""
 
 
+# Os pedidos de venda linha a linha, para o detalhe da cor: a rota principal volta
+# agregado por representante; aqui vem o codigo, o cliente e as datas. `Cliente` da
+# view e o CNPJ — o nome vem do cadastro.
+SQL_PEDIDOS = """
+select rtrim(q.Empresa) as empresa,
+       rtrim(q.Pedido) as pedido,
+       rtrim(q.Cliente) as cliente,
+       rtrim(cp.Razao_Nome_Cliente) as cliente_nome,
+       rtrim(q.Vendedor) as vendedor,
+       rtrim(v.Nome_Vendedores) as vendedor_nome,
+       rtrim(q.Produto) as produto,
+       rtrim(q.Cor) as cor,
+       q.Data_Pedido as data_pedido,
+       q.Data_Entrega as data_entrega,
+       q.Qtde_Ped as qtde_pedido,
+       q.Qtde_Rom as qtde_romaneada,
+       q.Saldo as saldo,
+       q.Vr_Total as valor,
+       rtrim(q.Status_Pedido) as status
+from DBMicrodata_DGB.dbo.Vw_Saldo_Pedido_Carteira_Qlik q
+left join DBMicrodata_DGB.dbo.Rec_Vendedores v
+  on v.Codigo_Vendedores = rtrim(q.Vendedor)
+left join DBMicrodata_DGB.dbo.Clientes_Principal cp
+  on cp.Codigo = rtrim(q.Cliente)
+where 1 = 1
+{onde}
+order by q.Data_Pedido desc, q.Pedido desc
+"""
+
+
 def _numero(valor: Any) -> float:
     return float(valor) if valor is not None else 0.0
 
@@ -325,6 +355,59 @@ def estoque_disponibilidade(
         "valor_prometido": sum(linha["prometido_valor"] for linha in saidas),
     }
     return {"resumo": resumo, "linhas": saidas}
+
+
+@router.get("/estoque-disponibilidade/pedidos")
+def estoque_disponibilidade_pedidos(
+    usuario: _dependente,
+    produto: str | None = Query(None, description="Codigo do produto"),
+    cor: str | None = Query(None, description="Codigo da cor"),
+    empresa: str | None = Query(None, description="Empresa; so o admin troca a do token"),
+) -> dict[str, Any]:
+    """Os pedidos de venda que formam o prometido de uma produto/cor, um a um.
+
+    A rota principal volta agregado por representante; aqui vem o **codigo do pedido**,
+    o cliente e as datas — o que o comercial precisa para cobrar quem prometeu, e o
+    que o PDF/CSV do relatorio lista linha a linha.
+    """
+    empresa_alvo = empresa_efetiva(usuario, empresa)
+    filtros: list[tuple[str, Any]] = []
+    if empresa_alvo:
+        filtros.append(("q.Empresa = ?", empresa_alvo))
+    if produto:
+        filtros.append(("rtrim(q.Produto) = ?", produto.strip()))
+    if cor:
+        filtros.append(("rtrim(q.Cor) = ?", cor.strip()))
+
+    linhas = _consultar_erp(SQL_PEDIDOS, filtros)
+    saidas = [
+        {
+            "empresa": _texto(linha["empresa"]),
+            "pedido": _texto(linha["pedido"]),
+            "cliente": _texto(linha["cliente"]),
+            "cliente_nome": _texto(linha["cliente_nome"]),
+            "vendedor": _texto(linha["vendedor"]),
+            "vendedor_nome": _texto(linha["vendedor_nome"]),
+            "produto": _texto(linha["produto"]),
+            "cor": _texto(linha["cor"]),
+            "data_pedido": _data(linha["data_pedido"]),
+            "data_entrega": _data(linha["data_entrega"]),
+            "qtde_pedido": _numero(linha["qtde_pedido"]),
+            "qtde_romaneada": _numero(linha["qtde_romaneada"]),
+            "saldo": _numero(linha["saldo"]),
+            "valor": _numero(linha["valor"]),
+            "status": _texto(linha["status"]),
+        }
+        for linha in linhas
+        if _numero(linha["saldo"]) > 0
+    ]
+    saidas.sort(key=lambda linha: (linha["data_pedido"] or "", linha["pedido"]), reverse=True)
+    return {
+        "total": len(saidas),
+        "saldo": sum(linha["saldo"] for linha in saidas),
+        "valor": sum(linha["valor"] for linha in saidas),
+        "pedidos": saidas,
+    }
 
 
 __all__ = ["router"]
