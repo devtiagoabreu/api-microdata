@@ -9,6 +9,7 @@ from src.api.routers import (
     auth,
     contas_pagas_detalhe,
     custos_administrativos,
+    disponibilidade,
     estoque,
     faturamento_detalhe,
     infra,
@@ -37,6 +38,7 @@ app.add_middleware(
 app.include_router(infra.router)
 app.include_router(auth.router)
 app.include_router(estoque.router)
+app.include_router(disponibilidade.router)
 app.include_router(kpis.router)
 app.include_router(faturamento_detalhe.router)
 app.include_router(custos_administrativos.router)
