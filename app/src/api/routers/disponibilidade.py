@@ -151,6 +151,38 @@ def _consultar_erp(sql: str, filtros: list[tuple[str, Any]]) -> list[dict[str, A
     return erp.query(sql, params)
 
 
+# Catalogo, para o nome de produto e cor que nao tem peca em estoque.
+#
+# `core.estoque_pecas_em_aberto` traz `prod_desc`/`cor_desc` por join, so que so chegam
+# ao resultado as cores que tem peca: uma cor prometida e ainda nao comprada voltava
+# com codigo em vez de nome — que e o que a tela mostrava. Aqui o nome vem do cadastro
+# (`Produtos` e `Car_Cores`), que cobre as duas situacoes.
+SQL_CATALOGO_PRODUTOS = """
+select rtrim(p.Codigo) as codigo, rtrim(p.Descricao) as descricao
+from DBMicrodata_DGB.dbo.Produtos p
+where p.Codigo in ({marcadores})
+"""
+
+SQL_CATALOGO_CORES = """
+select rtrim(c.Codigo) as codigo, rtrim(c.Descricao) as descricao
+from DBMicrodata_DGB.dbo.Car_Cores c
+where c.Codigo in ({marcadores})
+"""
+
+
+def _nomes(codigos: list[str], sql: str) -> dict[str, str]:
+    """`codigo -> descricao`. O `IN` e montado com a quantidade de `?` que o `erp.query` aceita."""
+    unicos = sorted({c for c in codigos if c})[:900]
+    if not unicos:
+        return {}
+    linhas = erp.query(sql.format(marcadores=", ".join(["?"] * len(unicos))), tuple(unicos))
+    return {
+        _texto(linha["codigo"]): _texto(linha["descricao"])
+        for linha in linhas
+        if _texto(linha["descricao"])
+    }
+
+
 @router.get("/estoque-disponibilidade")
 def estoque_disponibilidade(
     usuario: _dependente,
@@ -265,6 +297,20 @@ def estoque_disponibilidade(
         if so_chegando and linha["caminho_metros"] <= 0:
             continue
         saidas.append(linha)
+
+    # Nome de produto e cor para quem ainda nao tem: so o estoque traz descricao (por
+    # join), e cor prometida sem peca voltava com codigo. Uma consulta no cadastro
+    # resolve — e so quando falta algum, que e o caso raro.
+    faltando_produto = [linha for linha in saidas if not linha["produto_desc"]]
+    faltando_cor = [linha for linha in saidas if not linha["cor_desc"]]
+    if faltando_produto:
+        nomes = _nomes([item["produto"] for item in faltando_produto], SQL_CATALOGO_PRODUTOS)
+        for linha in saidas:
+            linha["produto_desc"] = linha["produto_desc"] or nomes.get(linha["produto"], "")
+    if faltando_cor:
+        cores = _nomes([item["cor"] for item in faltando_cor], SQL_CATALOGO_CORES)
+        for linha in saidas:
+            linha["cor_desc"] = linha["cor_desc"] or cores.get(linha["cor"], "")
 
     # Maior falta primeiro: e a pergunta que o comercial abre a tela para responder.
     saidas.sort(key=lambda linha: (-linha["falta_metros"], -linha["estoque_metros"]))

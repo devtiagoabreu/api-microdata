@@ -150,6 +150,46 @@ class TestRegra:
         assert linha["estoque_metros"] == 0.0
         assert linha["falta_metros"] == 27_300.0
 
+    def test_busca_o_nome_no_catalogo_quando_falta(self, fontes, monkeypatch):
+        # Cor prometida e ainda nao comprada nao tem peca, entao nao passa pelo join do
+        # estoque e voltava com codigo. A rota tem que buscar o nome no cadastro.
+        fontes["carteira"] = [
+            carteira_falsa(produto="000020", cor="00042", saldo=4_120.0)
+        ]
+        fontes["estoque"] = []  # sem peca: nao vem nome por este caminho
+
+        pedidos: list[tuple[str, tuple]] = []
+
+        def consulta(sql, params):
+            pedidos.append((sql, tuple(params)))
+            # O `format` dos marcadores devolve uma string nova, entao o match e por conteudo.
+            if "Produtos p" in sql:
+                return [{"codigo": "000020", "descricao": "VELUDO SILVER"}]
+            if "Car_Cores c" in sql:
+                return [{"codigo": "00042", "descricao": "42 - OFF WHITE"}]
+            raise AssertionError(f"SQL inesperado: {sql}")
+
+        monkeypatch.setattr(disponibilidade.erp, "query", consulta)
+
+        linha = client.get("/estoque-disponibilidade").json()["linhas"][0]
+
+        assert linha["produto_desc"] == "VELUDO SILVER"
+        assert linha["cor_desc"] == "42 - OFF WHITE"
+        # Um marcador por codigo, nao a lista repetida
+        consulta_produto = next(p for sql, p in pedidos if "Produtos p" in sql)
+        assert consulta_produto == ("000020",)
+
+    def test_nao_consulta_catalogo_quando_tem_nome(self, fontes, monkeypatch):
+        fontes["estoque"] = [estoque_falso(desc="VELUDO CONFORT", cor_desc="5 - BLACK")]
+
+        def consulta(sql, params):  # pragma: no cover - nao deve ser chamado
+            raise AssertionError(f"SQL inesperado: {sql}")
+
+        monkeypatch.setattr(disponibilidade.erp, "query", consulta)
+
+        linha = client.get("/estoque-disponibilidade").json()["linhas"][0]
+        assert linha["produto_desc"] == "VELUDO CONFORT"
+
     def test_so_com_falta_e_um_pos_filtro(self, fontes):
         fontes["estoque"] = [
             estoque_falso(cor="00005", metros=5_000.0),
@@ -245,9 +285,13 @@ class TestContrato:
         assert "/estoque-disponibilidade" in app.openapi()["paths"]
 
     def test_sql_do_erp_e_somente_leitura(self):
-        for sql in (disponibilidade.SQL_CAMINHO, disponibilidade.SQL_CARTEIRA):
-            sql_com_where = sql.replace("{onde}", "")
-            erp.assert_read_only(sql_com_where)
+        for sql in (
+            disponibilidade.SQL_CAMINHO,
+            disponibilidade.SQL_CARTEIRA,
+            disponibilidade.SQL_CATALOGO_PRODUTOS,
+            disponibilidade.SQL_CATALOGO_CORES,
+        ):
+            erp.assert_read_only(sql.replace("{marcadores}", "?").replace("{onde}", ""))
 
     def test_a_compra_em_transito_so_olha_entrega_futura(self):
         assert "p.Data_Entrega >= getdate()" in disponibilidade.SQL_CAMINHO
