@@ -11,14 +11,27 @@ mesmas linhas e a mesma soma, com diferença R$ 0,00 em cada um dos 12 meses de
 out/2025 a set/2026. Os joins com `Clientes_Principal` (fornecedor) e `Bancos`
 são 1:1 — nenhum `(Codigo, Tipo)` nem `Nr_Bco_Bancos` duplicado — então não
 duplicam linha nem alteram o total.
+
+**Classificação por departamento/despesa.** `Pag_Baixas` não tem centro de custo:
+quem sabe é a `sp_PagRel_CCusto_Niveis` (a mesma que alimenta o custo
+administrativo, `custos_administrativos.py`), chamada com `@Tipo = 'B'` para as
+baixas. A chave de junção é
+`(Empresa, Documento+Serie, CodFornecedor, PArcela, Data_Baixa)` — a procedure
+concatena documento e série num campo só. Conferido no ERP: em set/2026 as 118
+baixas casam 118, sem sobra e sem divergência de valor nas linhas 1:1.
+
+Quando duas baixas compartilham a chave (parcela repetida no mesmo dia), a
+procedure devolve as duas linhas de rateio. Aí o item fica com a linha de maior
+valor e `rateio=True`, para a tela não esconder isso: os grupos por departamento
+somam o `Valor_Pago` da baixa, não o rateio, e continuam batendo com o total.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from src.api.auth.escopos import ESCOPO_FINANCEIRO, exigir_escopo
 from src.api.auth.usuarios import Usuario
@@ -60,10 +73,21 @@ select pb.Empresa as Empresa, pb.Documento as Documento,
 from DBMicrodata_DGB.dbo.Pag_Baixas pb
 left join DBMicrodata_DGB.dbo.Clientes_Principal cp
        on cp.Codigo = pb.Fornecedor and cp.Tipo = pb.Tipo_Fornec
-left join DBMicrodata_DGB.dbo.Bancos b on b.Nr_Bco_Bancos = pb.Nr_Banco
+    left join DBMicrodata_DGB.dbo.Bancos b on b.Nr_Bco_Bancos = pb.Nr_Banco
 where pb.Data_Baixa >= ? and pb.Data_Baixa < ?
 order by pb.Data_Baixa desc, pb.Documento
 """
+
+# Despesa e departamento de cada baixa. Mesma procedure do custo administrativo,
+# com todos os departamentos (os `@CodDpto*` em 0 = sem filtro) e sem filtro de
+# empresa, porque `Pag_Baixas` também não filtra. O `'(''13'',''14'')'` do custo
+# administrativo é o `@Empresa`; aqui vem vazio para pegar tudo que a tela lista.
+SQL_CLASSIFICACAO = (
+    "exec dbo.sp_PagRel_CCusto_Niveis "
+    "'', ?, ?, 'B', 'D', ?, '', '', "
+    "0,0,0,0,0,0,0,0,0,0,0,0,0, '', ''"
+)
+
 
 
 def _texto(valor: Any) -> str:
@@ -154,25 +178,106 @@ def _agrupar(itens: list[dict[str, Any]], chave: str) -> list[dict[str, Any]]:
     return sorted(mapa.values(), key=lambda g: -g["valor"])
 
 
+def _data_curta(valor: Any) -> str:
+    """`Data_Baixa` como `YYYY-MM-DD`, para montar a chave de junção."""
+    if isinstance(valor, datetime):
+        return valor.date().isoformat()
+    if isinstance(valor, date):
+        return valor.isoformat()
+    return ""
+
+
+def _codigo_departamento(linha: dict[str, Any]) -> str:
+    return ".".join(str(linha.get(f"CodDpto{n}") or 0) for n in (1, 2, 3, 4))
+
+
+def _chave_classificacao(
+    empresa: str,
+    documento: str,
+    serie: str,
+    fornecedor: str,
+    parcela: str,
+    data_baixa: str,
+) -> tuple[str, str, str, str, str]:
+    return (empresa, f"{documento}{serie}", fornecedor, parcela, data_baixa)
+
+
+def _classificacoes(
+    inicio: date, fim: date
+) -> dict[tuple[str, str, str, str, str], dict[str, Any]]:
+    """Despesa/departamento de cada baixa no período, indexados pela chave.
+
+    A procedure devolve `Documento` já com a série grudada, e `Data_Baixa` como
+    `smalldatetime`. Quando a chave repete (parcela duplicada no mesmo dia), vence
+    a linha de maior valor e a baixa é marcada com `rateio`.
+    """
+    linhas = erp.ultimo_resultado(SQL_CLASSIFICACAO, (inicio, fim, fim))
+    indice: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for linha in linhas:
+        chave = (
+            _texto(linha.get("Empresa")),
+            _texto(linha.get("Documento")),
+            _texto(linha.get("CodFornecedor")),
+            _texto(linha.get("PArcela")),
+            _data_curta(linha.get("Data_Baixa")),
+        )
+        classificacao = {
+            "departamento": _texto(linha.get("DescDpto4")),
+            "departamento_codigo": _codigo_departamento(linha),
+            "despesa": _texto(linha.get("DescDesp1")),
+            "despesa_2": _texto(linha.get("DescDesp2")),
+        }
+        valor = abs(_numero(linha.get("Valor_Baixado")))
+        anterior = indice.get(chave)
+        if anterior is None:
+            indice[chave] = {**classificacao, "rateio": False, "valor_avaliado": valor}
+            continue
+        # Chave repetida: a procedure rateou entre linhas. A baixa fica com a linha
+        # maior e oGroups somam o `Valor_Pago` da baixa, não o rateio.
+        if valor > anterior["valor_avaliado"]:
+            indice[chave] = {**classificacao, "rateio": True, "valor_avaliado": valor}
+        else:
+            anterior["rateio"] = True
+    for classificacao in indice.values():
+        classificacao.pop("valor_avaliado", None)
+    return indice
+
+
 @router.get("/contas-pagas-detalhe")
 def contas_pagas_detalhe(
-    usuario: _financeiro, data: date | None = None
+    usuario: _financeiro,
+    data: date | None = None,
+    data_inicio: date | None = None,
+    data_fim: date | None = None,
 ) -> dict[str, Any]:
     """As baixas de contas pagas do mês de referência e as 4 janelas do card.
 
-    `data` (opcional, padrão hoje) ancla o mês: o card compara esse mês com o
+    `data` (opcional, padrão hoje) ancora o mês: o card compara esse mês com o
     anterior, o acumulado do ano e o ano anterior.
 
-    Os lançamentos vêm só do mês de referência (o que a tela lista); as outras
-    três janelas entram como total e contagem, que é tudo que o card mostra.
+    `data_inicio`/`data_fim` (ambos inclusive) recortam a lista e os grupos. Sem
+    eles, a lista é o mês inteiro. Os cards continuam sendo do mês âncora — é o
+    que o card do BI mede — e `periodo` diz o recorte que está na tela, para não
+    haver dúvida entre o total do card e o da lista.
+
+    Os lançamentos das outras três janelas entram como total e contagem, que é
+    tudo que o card mostra.
     """
     referencia = data or date.today()
     janelas = _janelas(referencia)
-    inicio, fim = janelas["mes"]
+    inicio_mes, fim_mes = janelas["mes"]
+
+    if data_inicio and data_fim and data_inicio > data_fim:
+        raise HTTPException(
+            status_code=422, detail="data_inicio não pode ser depois de data_fim"
+        )
+
+    inicio_lista = data_inicio or inicio_mes
+    fim_lista = (data_fim + timedelta(days=1)) if data_fim else fim_mes
 
     inicio_serie = date(referencia.year - 2, 1, 1)
     mensal: dict[tuple[int, int], dict[str, Any]] = {}
-    for linha in erp.query(SQL_SERIE, (inicio_serie, fim)):
+    for linha in erp.query(SQL_SERIE, (inicio_serie, max(fim_mes, fim_lista))):
         mes = linha["mes"]
         mensal[(mes.year, mes.month)] = {
             "total": float(linha["total"] or 0),
@@ -192,13 +297,36 @@ def contas_pagas_detalhe(
             "lancamentos": sum(d["lancamentos"] for d in valores),
         }
 
-    itens = [_item(linha) for linha in erp.query(SQL_ITENS, (inicio, fim))]
-    total_mes = sum(item["valor"] for item in itens)
+    linhas = erp.query(SQL_ITENS, (inicio_lista, fim_lista))
+    classificacoes = _classificacoes(inicio_lista, fim_lista)
+    itens = [_item(linha) for linha in linhas]
+    for item in itens:
+        classificacao = classificacoes.get(
+            _chave_classificacao(
+                item["empresa"],
+                item["documento"],
+                item["serie"],
+                item["fornecedor"],
+                item["parcela"],
+                item["data_baixa"] or "",
+            )
+        )
+        item.update(
+            classificacao
+            or {
+                "departamento": "",
+                "departamento_codigo": "",
+                "despesa": "",
+                "despesa_2": "",
+                "rateio": False,
+            }
+        )
+    total_lista = sum(item["valor"] for item in itens)
 
     # 24 meses terminando na referência, para dar contexto às 4 janelas.
     meses = []
     for passo in range(-23, 1):
-        chave = _primeiro_dia(_somar_meses(inicio, passo))
+        chave = _primeiro_dia(_somar_meses(inicio_mes, passo))
         dados = mensal.get((chave.year, chave.month), {"total": 0.0, "lancamentos": 0})
         meses.append(
             {
@@ -209,23 +337,36 @@ def contas_pagas_detalhe(
             }
         )
 
+    recorte_total_mes = inicio_lista == inicio_mes and fim_lista == fim_mes
     return {
         "referencia": {
             **_periodo(
-                MESES_BR[inicio.month],
-                inicio,
-                _proximo_mes(inicio),
+                MESES_BR[inicio_mes.month],
+                inicio_mes,
+                _proximo_mes(inicio_mes),
             ),
-            "mes": f"{inicio.year}-{inicio.month:02d}",
+            "mes": f"{inicio_mes.year}-{inicio_mes.month:02d}",
+        },
+        # O recorte que a lista está mostrando. Igual ao mês âncora quando a tela
+        # não mexeu nas datas; a tela mostra a faixa para não confundir com o card.
+        "periodo": {
+            **_periodo(
+                "Período em exibição" if not recorte_total_mes else MESES_BR[inicio_mes.month],
+                inicio_lista,
+                fim_lista,
+            ),
+            "recorte": not recorte_total_mes,
         },
         "mes": {
-            **_periodo(MESES_BR[inicio.month], inicio, _proximo_mes(inicio)),
-            "total": total_mes,
+            **_periodo(MESES_BR[inicio_mes.month], inicio_mes, _proximo_mes(inicio_mes)),
+            "total": total_lista,
             "lancamentos": len(itens),
             "itens": itens,
             "por_fornecedor": _agrupar(itens, "razao_social"),
             "por_banco": _agrupar(itens, "banco"),
             "por_empresa": _agrupar(itens, "empresa"),
+            "por_departamento": _agrupar(itens, "departamento"),
+            "por_despesa": _agrupar(itens, "despesa"),
         },
         "mes_anterior": bloco("mes_anterior", "Mês anterior"),
         "ano_atual": bloco("ano_atual", "Ano atual"),

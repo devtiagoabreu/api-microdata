@@ -57,6 +57,39 @@ def _serie_mes(mes: str, total: str, lancamentos: int = 1) -> dict:
     }
 
 
+def _classificacao(
+    documento: str = "000007424U",
+    serie: str = "U   ",
+    fornecedor: str = "00055",
+    razao: str = "MF LOG TRANSPORTES LTDA",
+    empresa: str = "13",
+    parcela: str = "01",
+    baixa: str = "2026-09-30",
+    dpto: str = "TRANSPORTE",
+    cod_dpto: tuple[int, int, int, int] = (1, 1, 5, 1),
+    despesa: str = "FIXOS VARIAVEIS",
+    despesa_2: str = "IMPORTACAO",
+    valor: str = "2068.73",
+) -> dict:
+    """Linha da `sp_PagRel_CCusto_Niveis` — documento já vem com a série grudada."""
+    return {
+        "Empresa": empresa,
+        "Documento": documento,
+        "CodFornecedor": fornecedor,
+        "Razao_Nome_Cliente": razao,
+        "PArcela": parcela,
+        "Data_Baixa": datetime.fromisoformat(baixa),
+        "DescDpto4": dpto,
+        "CodDpto1": cod_dpto[0],
+        "CodDpto2": cod_dpto[1],
+        "CodDpto3": cod_dpto[2],
+        "CodDpto4": cod_dpto[3],
+        "DescDesp1": despesa,
+        "DescDesp2": despesa_2,
+        "Valor_Baixado": Decimal(valor),
+    }
+
+
 @pytest.fixture(autouse=True)
 def sem_auth(monkeypatch):
     monkeypatch.setenv("API_AUTENTICACAO_EXIGIDA", "false")
@@ -64,16 +97,27 @@ def sem_auth(monkeypatch):
 
 @pytest.fixture
 def erp_mock(monkeypatch):
-    """Separa as duas consultas: série mensal e itens do mês."""
+    """Separa as três consultas: série mensal, itens do recorte e classificação.
 
-    def montar(itens, serie):
-        chamadas: list[str] = []
+    `ultimo_resultado` abre a própria conexão (por isso a procedure do centro de
+    custo), então precisa ser mockado à parte — sem isso o teste iria no ERP de
+    verdade só para descobrir que não há classificação.
+    """
+
+    def montar(itens, serie, classificacoes=()):
+        chamadas: list[tuple[str, tuple]] = []
 
         def query(sql: str, params=None):
-            chamadas.append("serie" if sql is detalhe.SQL_SERIE else "itens")
+            tipo = "serie" if sql is detalhe.SQL_SERIE else "itens"
+            chamadas.append((tipo, tuple(params or ())))
             return list(serie) if sql is detalhe.SQL_SERIE else list(itens)
 
+        def ultimo_resultado(sql: str, params=None):
+            chamadas.append(("classificacao", tuple(params or ())))
+            return list(classificacoes)
+
         monkeypatch.setattr(detalhe.erp, "query", query)
+        monkeypatch.setattr(detalhe.erp, "ultimo_resultado", ultimo_resultado)
         return chamadas
 
     return montar
@@ -223,24 +267,157 @@ class TestRota:
         assert corpo["ano_anterior"]["periodo"] == "01/01/2025 a 31/12/2025"
         assert corpo["referencia"]["rotulo"] == "outubro"
 
-    def test_usa_uma_consulta_de_serie_e_uma_de_itens(self, erp_mock):
+    def test_usa_uma_consulta_de_serie_uma_de_itens_e_una_de_classificacao(self, erp_mock):
         chamadas = erp_mock([_linha()], [_serie_mes("2026-10", "2068.73")])
         client.get("/contas-pagas-detalhe", params={"data": "2026-10-13"}).json()
-        assert chamadas.count("serie") == 1
-        assert chamadas.count("itens") == 1
+        tipos = [tipo for tipo, _ in chamadas]
+        assert tipos == ["serie", "itens", "classificacao"]
+        # A classificação cobre a mesma janela dos itens — senão o departamento viria
+        # de outro período e o card não fecharia. A procedure recebe o fim de novo
+        # como @DatRetr.
+        janela_itens = chamadas[1][1]
+        assert chamadas[2][1] == janela_itens + (janela_itens[1],)
 
 
 class TestWhitelist:
-    def test_as_duas_consultas_passam_pelo_guard_de_leitura(self):
+    def test_as_consultas_passam_pelo_guard_de_leitura(self):
         from src.db.erp import assert_read_only
 
         assert_read_only(detalhe.SQL_SERIE)
         assert_read_only(detalhe.SQL_ITENS)
+        assert_read_only(detalhe.SQL_CLASSIFICACAO)
 
     def test_as_consultas_so_leem_nas_tabelas_da_base(self):
-        for sql in (detalhe.SQL_SERIE, detalhe.SQL_ITENS):
+        for sql in (detalhe.SQL_SERIE, detalhe.SQL_ITENS, detalhe.SQL_CLASSIFICACAO):
             baixo = sql.lower()
             assert "insert" not in baixo
             assert "update " not in baixo
             assert "delete" not in baixo
             assert "truncate" not in baixo
+
+
+class TestRecorteDeDatas:
+    """`data_inicio`/`data_fim` recortam a lista; os cards continuam do mês âncora."""
+
+    def test_sem_datas_a_lista_e_o_mes_inteiro(self, erp_mock):
+        erp_mock([_linha()], [_serie_mes("2026-09", "2068.73", 1)])
+        corpo = client.get(
+            "/contas-pagas-detalhe", params={"data": "2026-09-15"}
+        ).json()
+
+        assert corpo["periodo"]["periodo"] == "01/09/2026 a 30/09/2026"
+        assert corpo["periodo"]["recorte"] is False
+        assert corpo["mes"]["periodo"] == "01/09/2026 a 30/09/2026"
+
+    def test_o_intervalo_traz_somente_o_periodo_pedido(self, erp_mock):
+        chamadas = erp_mock([_linha()], [_serie_mes("2026-09", "2068.73", 1)])
+        corpo = client.get(
+            "/contas-pagas-detalhe",
+            params={"data_inicio": "2026-08-15", "data_fim": "2026-09-10"},
+        ).json()
+
+        assert corpo["periodo"]["periodo"] == "15/08/2026 a 10/09/2026"
+        assert corpo["periodo"]["recorte"] is True
+        # `data_fim` é inclusivo: vira dia seguinte exclusivo no SQL.
+        janela = [p for tipo, p in chamadas if tipo == "itens"][0]
+        assert janela == (date(2026, 8, 15), date(2026, 9, 11))
+
+    def test_data_inicio_depois_de_data_fim_e_recusado(self, erp_mock):
+        erp_mock([_linha()], [_serie_mes("2026-09", "2068.73", 1)])
+        resposta = client.get(
+            "/contas-pagas-detalhe",
+            params={"data_inicio": "2026-09-10", "data_fim": "2026-09-01"},
+        )
+
+        assert resposta.status_code == 422
+        assert "data_inicio" in resposta.json()["detail"]
+
+
+class TestClassificacao:
+    def test_a_baixa_recebe_departamento_e_despesa(self, erp_mock):
+        erp_mock(
+            [_linha(valor="2068.73")],
+            [_serie_mes("2026-09", "2068.73", 1)],
+            [_classificacao(valor="2068.73")],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe", params={"data": "2026-09-15"}
+        ).json()
+
+        item = corpo["mes"]["itens"][0]
+        assert item["departamento"] == "TRANSPORTE"
+        assert item["departamento_codigo"] == "1.1.5.1"
+        assert item["despesa"] == "FIXOS VARIAVEIS"
+        assert item["despesa_2"] == "IMPORTACAO"
+        assert item["rateio"] is False
+
+    def test_baixa_sem_classificacao_agrupa_como_traco(self, erp_mock):
+        erp_mock(
+            [_linha(valor="2068.73")],
+            [_serie_mes("2026-09", "2068.73", 1)],
+            [],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe", params={"data": "2026-09-15"}
+        ).json()
+
+        item = corpo["mes"]["itens"][0]
+        assert item["departamento"] == ""
+        assert [g["departamento"] for g in corpo["mes"]["por_departamento"]] == ["—"]
+
+    def test_rateio_fica_com_a_linha_maior_e_marca_a_baixa(self, erp_mock):
+        # Mesma chave nas duas linhas: a baixa fica com a maior e avisa que houve
+        # rateio, para a tela não apresentar um departamento como se fosse o todo.
+        erp_mock(
+            [_linha(valor="9208.48")],
+            [_serie_mes("2026-09", "9208.48", 1)],
+            [
+                _classificacao(dpto="IMPORTACAO", cod_dpto=(1, 1, 6, 1), valor="2482.58"),
+                _classificacao(dpto="TRANSPORTE", cod_dpto=(1, 1, 5, 1), valor="9208.48"),
+            ],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe", params={"data": "2026-09-15"}
+        ).json()
+
+        item = corpo["mes"]["itens"][0]
+        assert item["departamento"] == "TRANSPORTE"
+        assert item["rateio"] is True
+
+    def test_grupos_somam_o_valor_pago_das_baixas(self, erp_mock):
+        # O rateio da procedure traz 11.691,06 para uma baixa de 9.208,48. O grupo
+        # tem de somar os 9.208,48, senão a tela mostra um total que não bate com o
+        # card de contas pagas.
+        erp_mock(
+            [_linha(valor="9208.48"), _linha(documento="X", valor="1000")],
+            [_serie_mes("2026-09", "10208.48", 2)],
+            [
+                _classificacao(dpto="TRANSPORTE", cod_dpto=(1, 1, 5, 1), valor="2482.58"),
+                _classificacao(dpto="TRANSPORTE", cod_dpto=(1, 1, 5, 1), valor="9208.48"),
+                _classificacao(
+                    documento="XU", dpto="IMPORTACAO", cod_dpto=(1, 1, 6, 1), valor="1000"
+                ),
+            ],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe", params={"data": "2026-09-15"}
+        ).json()
+
+        soma = sum(g["valor"] for g in corpo["mes"]["por_departamento"])
+        assert round(soma, 2) == round(corpo["mes"]["total"], 2)
+        assert corpo["mes"]["total"] == pytest.approx(10208.48)
+
+    def test_o_periodo_alimentado_por_departamento_e_despesa_existe(self, erp_mock):
+        erp_mock(
+            [_linha(valor="100")],
+            [_serie_mes("2026-09", "100", 1)],
+            [_classificacao(valor="100")],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe", params={"data": "2026-09-15"}
+        ).json()
+
+        assert corpo["mes"]["por_departamento"][0]["departamento"] == "TRANSPORTE"
+        assert corpo["mes"]["por_despesa"][0]["despesa"] == "FIXOS VARIAVEIS"
+        assert corpo["mes"]["por_fornecedor"][0]["lancamentos"] == 1
+
