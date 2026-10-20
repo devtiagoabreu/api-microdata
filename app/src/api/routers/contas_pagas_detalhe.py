@@ -260,6 +260,12 @@ def contas_pagas_detalhe(
     que o card do BI mede — e `periodo` diz o recorte que está na tela, para não
     haver dúvida entre o total do card e o da lista.
 
+    **Modo "Todos".** Quando `data` não vem, a âncora dos 4 cards fixos é hoje (a
+    tela usa `referencia` para preencher a data final), mas a lista e os grupos
+    são o intervalo `data_inicio`..`data_fim` inteiro — é o que a tela chama de
+    "Todos os meses". `periodo` traz `total`/`lancamentos` do intervalo, para o
+    card do período não depender de somar os itens na tela.
+
     Os lançamentos das outras três janelas entram como total e contagem, que é
     tudo que o card mostra.
     """
@@ -323,6 +329,12 @@ def contas_pagas_detalhe(
         )
     total_lista = sum(item["valor"] for item in itens)
 
+    # A primeira baixa *do que a consulta trouxe*. É o que a tela usa para nascer com
+    # a data inicial preenchida: sem isso ela abriria vazia, e o seletor de meses não
+    # teria de onde sair. Vem do conjunto retornado, não de uma query à parte.
+    datas = [item["data_baixa"] for item in itens if item["data_baixa"]]
+    min_data = min(datas) if datas else None
+
     # 24 meses terminando na referência, para dar contexto às 4 janelas.
     meses = []
     for passo in range(-23, 1):
@@ -349,6 +361,8 @@ def contas_pagas_detalhe(
         },
         # O recorte que a lista está mostrando. Igual ao mês âncora quando a tela
         # não mexeu nas datas; a tela mostra a faixa para não confundir com o card.
+        # `total`/`lancamentos` são do intervalo — é o 5º card, o "período
+        # selecionado", que acompanha as datas em vez das janelas fixas.
         "periodo": {
             **_periodo(
                 "Período em exibição" if not recorte_total_mes else MESES_BR[inicio_mes.month],
@@ -356,7 +370,12 @@ def contas_pagas_detalhe(
                 fim_lista,
             ),
             "recorte": not recorte_total_mes,
+            "total": total_lista,
+            "lancamentos": len(itens),
         },
+        # A primeira baixa do conjunto consultado, para a tela nascer com a data
+        # inicial preenchida (e o seletor de meses saber onde começa).
+        "min_data": min_data,
         "mes": {
             **_periodo(MESES_BR[inicio_mes.month], inicio_mes, _proximo_mes(inicio_mes)),
             "total": total_lista,

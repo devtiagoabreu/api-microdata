@@ -333,6 +333,69 @@ class TestRecorteDeDatas:
         assert "data_inicio" in resposta.json()["detail"]
 
 
+class TestMinDataEPeriodo:
+    """`min_data` alimenta a data inicial da tela; `periodo` é o 5º card."""
+
+    def test_min_data_e_a_primeira_baixa_do_conjunto(self, erp_mock):
+        erp_mock(
+            [
+                _linha(documento="A", baixa="2026-09-30"),
+                _linha(documento="B", baixa="2026-08-15"),
+                _linha(documento="C", baixa="2026-09-02"),
+            ],
+            [],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe",
+            params={"data_inicio": "2026-08-01", "data_fim": "2026-09-30"},
+        ).json()
+
+        assert corpo["min_data"] == "2026-08-15"
+
+    def test_sem_baixas_min_data_e_nula(self, erp_mock):
+        erp_mock([], [_serie_mes("2026-09", "0", 0)])
+        corpo = client.get("/contas-pagas-detalhe", params={"data": "2026-09-15"}).json()
+
+        assert corpo["min_data"] is None
+
+    def test_periodo_traz_total_e_contagem_do_intervalo(self, erp_mock):
+        erp_mock(
+            [
+                _linha(documento="A", valor="100", baixa="2026-08-15"),
+                _linha(documento="B", valor="250", baixa="2026-09-10"),
+            ],
+            [],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe",
+            params={"data_inicio": "2026-08-01", "data_fim": "2026-09-30"},
+        ).json()
+
+        assert corpo["periodo"]["total"] == 350.0
+        assert corpo["periodo"]["lancamentos"] == 2
+        # O total do período é o mesmo da lista — são o mesmo recorte.
+        assert corpo["periodo"]["total"] == corpo["mes"]["total"]
+
+    def test_modo_todos_sem_data_usa_o_intervalo_e_ancora_os_cards_em_hoje(self, erp_mock):
+        # Sem `data`, os 4 cards fixos usam o mês corrente; a lista é o intervalo.
+        erp_mock(
+            [
+                _linha(documento="A", valor="100", baixa="2026-03-15"),
+                _linha(documento="B", valor="250", baixa="2026-07-10"),
+            ],
+            [_serie_mes("2026-07", "250", 1)],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe",
+            params={"data_inicio": "2026-01-01", "data_fim": "2026-07-31"},
+        ).json()
+
+        assert corpo["referencia"]["mes"] == date.today().strftime("%Y-%m")
+        assert corpo["mes"]["lancamentos"] == 2
+        assert corpo["periodo"]["recorte"] is True
+        assert corpo["periodo"]["total"] == 350.0
+
+
 class TestClassificacao:
     def test_a_baixa_recebe_departamento_e_despesa(self, erp_mock):
         erp_mock(
