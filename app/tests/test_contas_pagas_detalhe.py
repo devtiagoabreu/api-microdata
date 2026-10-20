@@ -208,7 +208,7 @@ class TestRota:
 
     def test_preserva_o_sinal_do_valor(self, erp_mock):
         # Sem abs(): o card soma Valor_Pago com o sinal que vier.
-        erp_mock([_linha(valor="-120.50")], [])
+        erp_mock([_linha(valor="-120.50")], [_serie_mes("2026-10", "-120.50", 1)])
         corpo = client.get(
             "/contas-pagas-detalhe", params={"data": "2026-10-13"}
         ).json()
@@ -373,8 +373,28 @@ class TestMinDataEPeriodo:
 
         assert corpo["periodo"]["total"] == 350.0
         assert corpo["periodo"]["lancamentos"] == 2
-        # O total do período é o mesmo da lista — são o mesmo recorte.
-        assert corpo["periodo"]["total"] == corpo["mes"]["total"]
+        # O card "Mês atual" é a janela fixa do mês âncora (hoje), não a lista:
+        # com recorte/sem `data`, a lista é o período e não pode inflar o card.
+        assert corpo["mes"]["total"] == 0.0
+
+    def test_mes_atual_e_a_janela_fixa_mesmo_com_recorte(self, erp_mock):
+        erp_mock(
+            [_linha(documento="A", valor="100", baixa="2026-08-15")],
+            [_serie_mes("2026-10", "500", 3)],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe",
+            params={
+                "data": "2026-10-13",
+                "data_inicio": "2026-08-01",
+                "data_fim": "2026-08-31",
+            },
+        ).json()
+
+        # A lista é agosto (recorte), mas o card do mês âncora é outubro.
+        assert corpo["periodo"]["total"] == 100.0
+        assert corpo["mes"]["total"] == 500.0
+        assert corpo["mes"]["lancamentos"] == 3
 
     def test_modo_todos_sem_data_usa_o_intervalo_e_ancora_os_cards_em_hoje(self, erp_mock):
         # Sem `data`, os 4 cards fixos usam o mês corrente; a lista é o intervalo.
@@ -391,7 +411,10 @@ class TestMinDataEPeriodo:
         ).json()
 
         assert corpo["referencia"]["mes"] == date.today().strftime("%Y-%m")
-        assert corpo["mes"]["lancamentos"] == 2
+        # A lista é o intervalo inteiro (2 baixas)...
+        assert len(corpo["mes"]["itens"]) == 2
+        # ...mas o card "Mês atual" é a janela de hoje, não a lista.
+        assert corpo["mes"]["lancamentos"] == 0
         assert corpo["periodo"]["recorte"] is True
         assert corpo["periodo"]["total"] == 350.0
 

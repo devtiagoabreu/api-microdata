@@ -256,15 +256,18 @@ def contas_pagas_detalhe(
     anterior, o acumulado do ano e o ano anterior.
 
     `data_inicio`/`data_fim` (ambos inclusive) recortam a lista e os grupos. Sem
-    eles, a lista é o mês inteiro. Os cards continuam sendo do mês âncora — é o
-    que o card do BI mede — e `periodo` diz o recorte que está na tela, para não
-    haver dúvida entre o total do card e o da lista.
+    eles, a lista é o mês inteiro. Os cards são as janelas fixas do mês âncora — é
+    o que o card do BI mede — e `periodo` diz o recorte que a tela está mostrando,
+    para não haver dúvida entre o total do card e o da lista. O card "Mês atual"
+    (`mes`) mede a janela do mês âncora, **não** a lista: com recorte, a lista é o
+    período inteiro e inflaria o card.
 
     **Modo "Todos".** Quando `data` não vem, a âncora dos 4 cards fixos é hoje (a
     tela usa `referencia` para preencher a data final), mas a lista e os grupos
     são o intervalo `data_inicio`..`data_fim` inteiro — é o que a tela chama de
     "Todos os meses". `periodo` traz `total`/`lancamentos` do intervalo, para o
-    card do período não depender de somar os itens na tela.
+    card do período não depender de somar os itens na tela; `mes` continua sendo a
+    janela de hoje, para o card "Mês atual" não herdar o total do período.
 
     Os lançamentos das outras três janelas entram como total e contagem, que é
     tudo que o card mostra.
@@ -376,10 +379,15 @@ def contas_pagas_detalhe(
         # A primeira baixa do conjunto consultado, para a tela nascer com a data
         # inicial preenchida (e o seletor de meses saber onde começa).
         "min_data": min_data,
+        # O card "Mês atual" mede a janela fixa do mês âncora (a mesma linha do
+        # card do BI), não a lista: com "Todos" ou um recorte, a lista é o período
+        # inteiro e o número do mês sairia inflado. Os itens/grupos continuam sendo
+        # da lista, que é o recorte que a tela está mostrando.
         "mes": {
-            **_periodo(MESES_BR[inicio_mes.month], inicio_mes, _proximo_mes(inicio_mes)),
-            "total": total_lista,
-            "lancamentos": len(itens),
+            **bloco(
+                "mes",
+                MESES_BR[inicio_mes.month],
+            ),
             "itens": itens,
             "por_fornecedor": _agrupar(itens, "razao_social"),
             "por_banco": _agrupar(itens, "banco"),
