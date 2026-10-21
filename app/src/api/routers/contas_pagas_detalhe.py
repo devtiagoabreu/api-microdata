@@ -57,6 +57,27 @@ SQL_SERIE = (
     "group by datefromparts(year(pb.Data_Baixa), month(pb.Data_Baixa), 1)"
 )
 
+# Faturamento mensal (Σ Vr_Total + Σ Acres_Desc) por `Data_Nota`, a mesma fonte e a
+# mesma fórmula do card "Faturamento" do BI (`kpis.SQL_FATURAMENTO_MENSAL`). É a base
+# da razão pagamento ÷ faturamento: uma única consulta mensal cobre todas as janelas
+# e o recorte, porque todas são somas de meses inteiros.
+SQL_FATURAMENTO_MENSAL = (
+    "select datefromparts(year(Data_Nota), month(Data_Nota), 1) as mes, "
+    "coalesce(sum(Vr_Total), 0) + coalesce(sum(Acres_Desc), 0) as total "
+    "from DBProDash.dbo.vwFaturamento "
+    "where Data_Nota >= ? and Data_Nota < ? "
+    "group by datefromparts(year(Data_Nota), month(Data_Nota), 1)"
+)
+
+# Faturamento do recorte exato (`data_inicio`..`data_fim`), que pode não fechar meses
+# inteiros (a tela nasce num trimestre, mas o usuário escolhe qualquer dia). A soma é
+# direta sobre `Data_Nota`, sem agrupar por mês, para não inflar o denominador.
+SQL_FATURAMENTO_INTERVALO = (
+    "select coalesce(sum(Vr_Total), 0) + coalesce(sum(Acres_Desc), 0) as total "
+    "from DBProDash.dbo.vwFaturamento "
+    "where Data_Nota >= ? and Data_Nota < ?"
+)
+
 # Os lançamentos do mês de referência, já com fornecedor e banco.
 # `rtrim` nos char/varchar: o ERP devolve o nome do fornecedor preenchido com
 # espaços até o tamanho do campo.
@@ -271,6 +292,13 @@ def contas_pagas_detalhe(
 
     Os lançamentos das outras três janelas entram como total e contagem, que é
     tudo que o card mostra.
+
+    **Faturamento.** Cada janela (e o `periodo`) traz `faturamento` — o
+    Σ(Vr_Total)+Σ(Acres_Desc) do `vwFaturamento` pela `Data_Nota`, mesma fonte e
+    fórmula do card "Faturamento" do BI. É a base da razão pagamento ÷ faturamento:
+    o detalhe vermelho dos cards (quando passa de 65%) e os dois gráficos de
+    participação do fornecedor/departamento. O faturamento do `periodo` é o do
+    recorte exato das datas (soma direta quando não fecha mês inteiro).
     """
     referencia = data or date.today()
     janelas = _janelas(referencia)
@@ -293,6 +321,22 @@ def contas_pagas_detalhe(
             "lancamentos": int(linha["lancamentos"] or 0),
         }
 
+    # Faturamento mensal do mesmo intervalo do mensal de baixas: cobre as 4 janelas
+    # (todas alinhadas ao mês) e ainda os meses que o recorte atravessa.
+    faturamento_mensal: dict[tuple[int, int], float] = {}
+    for linha in erp.query(
+        SQL_FATURAMENTO_MENSAL, (date(referencia.year - 1, 1, 1), max(fim_mes, fim_lista))
+    ):
+        mes = linha["mes"]
+        faturamento_mensal[(mes.year, mes.month)] = float(linha["total"] or 0)
+
+    def faturamento_das_janelas(ini: date, fim: date) -> float:
+        return sum(
+            valor
+            for (ano, mes), valor in faturamento_mensal.items()
+            if ini <= date(ano, mes, 1) < fim
+        )
+
     def bloco(nome: str, rotulo: str) -> dict[str, Any]:
         ini, f = janelas[nome]
         valores = [
@@ -304,6 +348,7 @@ def contas_pagas_detalhe(
             **_periodo(rotulo, ini, f),
             "total": sum(d["total"] for d in valores),
             "lancamentos": sum(d["lancamentos"] for d in valores),
+            "faturamento": faturamento_das_janelas(ini, f),
         }
 
     linhas = erp.query(SQL_ITENS, (inicio_lista, fim_lista))
@@ -332,6 +377,16 @@ def contas_pagas_detalhe(
         )
     total_lista = sum(item["valor"] for item in itens)
 
+    # Faturamento do recorte exato da lista: quando as datas fecham o mês âncora, é a
+    # própria janela `mes`; fora disso (trimestre, dia a dia), soma direta no intervalo
+    # para não inflar o denominador da razão pagamento ÷ faturamento.
+    recorte_total_mes = inicio_lista == inicio_mes and fim_lista == fim_mes
+    if recorte_total_mes:
+        faturamento_lista = faturamento_das_janelas(inicio_mes, fim_mes)
+    else:
+        linha_fat = erp.query(SQL_FATURAMENTO_INTERVALO, (inicio_lista, fim_lista))
+        faturamento_lista = float(linha_fat[0]["total"] or 0) if linha_fat else 0.0
+
     # A primeira baixa *do que a consulta trouxe*. É o que a tela usa para nascer com
     # a data inicial preenchida: sem isso ela abriria vazia, e o seletor de meses não
     # teria de onde sair. Vem do conjunto retornado, não de uma query à parte.
@@ -352,7 +407,6 @@ def contas_pagas_detalhe(
             }
         )
 
-    recorte_total_mes = inicio_lista == inicio_mes and fim_lista == fim_mes
     return {
         "referencia": {
             **_periodo(
@@ -375,6 +429,9 @@ def contas_pagas_detalhe(
             "recorte": not recorte_total_mes,
             "total": total_lista,
             "lancamentos": len(itens),
+            # Faturamento do mesmo recorte: é o denominador da razão pagamento ÷
+            # faturamento (o detalhe vermelho dos cards e os dois gráficos).
+            "faturamento": faturamento_lista,
         },
         # A primeira baixa do conjunto consultado, para a tela nascer com a data
         # inicial preenchida (e o seletor de meses saber onde começa).

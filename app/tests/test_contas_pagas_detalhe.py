@@ -57,6 +57,11 @@ def _serie_mes(mes: str, total: str, lancamentos: int = 1) -> dict:
     }
 
 
+def _faturamento_mes(mes: str, total: str) -> dict:
+    ano, m = mes.split("-")
+    return {"mes": date(int(ano), int(m), 1), "total": Decimal(total)}
+
+
 def _classificacao(
     documento: str = "000007424U",
     serie: str = "U   ",
@@ -104,13 +109,20 @@ def erp_mock(monkeypatch):
     verdade só para descobrir que não há classificação.
     """
 
-    def montar(itens, serie, classificacoes=()):
+    def montar(itens, serie, classificacoes=(), faturamento=(), faturamento_intervalo="0"):
         chamadas: list[tuple[str, tuple]] = []
 
         def query(sql: str, params=None):
-            tipo = "serie" if sql is detalhe.SQL_SERIE else "itens"
+            if sql is detalhe.SQL_SERIE:
+                tipo, dados = "serie", list(serie)
+            elif sql is detalhe.SQL_FATURAMENTO_MENSAL:
+                tipo, dados = "faturamento_mensal", list(faturamento)
+            elif sql is detalhe.SQL_FATURAMENTO_INTERVALO:
+                tipo, dados = "faturamento_intervalo", [{"total": Decimal(faturamento_intervalo)}]
+            else:
+                tipo, dados = "itens", list(itens)
             chamadas.append((tipo, tuple(params or ())))
-            return list(serie) if sql is detalhe.SQL_SERIE else list(itens)
+            return dados
 
         def ultimo_resultado(sql: str, params=None):
             chamadas.append(("classificacao", tuple(params or ())))
@@ -271,12 +283,13 @@ class TestRota:
         chamadas = erp_mock([_linha()], [_serie_mes("2026-10", "2068.73")])
         client.get("/contas-pagas-detalhe", params={"data": "2026-10-13"}).json()
         tipos = [tipo for tipo, _ in chamadas]
-        assert tipos == ["serie", "itens", "classificacao"]
+        # Uma consulta de série, uma de itens, uma de faturamento e a classificação.
+        assert tipos == ["serie", "faturamento_mensal", "itens", "classificacao"]
         # A classificação cobre a mesma janela dos itens — senão o departamento viria
         # de outro período e o card não fecharia. A procedure recebe o fim de novo
         # como @DatRetr.
-        janela_itens = chamadas[1][1]
-        assert chamadas[2][1] == janela_itens + (janela_itens[1],)
+        janela_itens = chamadas[2][1]
+        assert chamadas[3][1] == janela_itens + (janela_itens[1],)
 
 
 class TestWhitelist:
@@ -286,9 +299,17 @@ class TestWhitelist:
         assert_read_only(detalhe.SQL_SERIE)
         assert_read_only(detalhe.SQL_ITENS)
         assert_read_only(detalhe.SQL_CLASSIFICACAO)
+        assert_read_only(detalhe.SQL_FATURAMENTO_MENSAL)
+        assert_read_only(detalhe.SQL_FATURAMENTO_INTERVALO)
 
     def test_as_consultas_so_leem_nas_tabelas_da_base(self):
-        for sql in (detalhe.SQL_SERIE, detalhe.SQL_ITENS, detalhe.SQL_CLASSIFICACAO):
+        for sql in (
+            detalhe.SQL_SERIE,
+            detalhe.SQL_ITENS,
+            detalhe.SQL_CLASSIFICACAO,
+            detalhe.SQL_FATURAMENTO_MENSAL,
+            detalhe.SQL_FATURAMENTO_INTERVALO,
+        ):
             baixo = sql.lower()
             assert "insert" not in baixo
             assert "update " not in baixo
@@ -506,4 +527,76 @@ class TestClassificacao:
         assert corpo["mes"]["por_departamento"][0]["departamento"] == "TRANSPORTE"
         assert corpo["mes"]["por_despesa"][0]["despesa"] == "FIXOS VARIAVEIS"
         assert corpo["mes"]["por_fornecedor"][0]["lancamentos"] == 1
+
+
+class TestFaturamento:
+    """O faturamento base é o do `vwFaturamento` (Σ Vr_Total + Σ Acres_Desc).
+
+    Cada janela e o `periodo` trazem `faturamento`, que é o denominador da razão
+    pagamento ÷ faturamento usada pelos cards e pelos dois gráficos de participação.
+    """
+
+    def test_cada_janela_traz_o_faturamento_do_mesmo_periodo(self, erp_mock):
+        erp_mock(
+            [_linha(valor="150")],
+            [_serie_mes("2026-10", "150", 1)],
+            faturamento=[
+                _faturamento_mes("2025-06", "4000"),
+                _faturamento_mes("2026-09", "2000"),
+                _faturamento_mes("2026-10", "3000"),
+            ],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        assert corpo["mes"]["faturamento"] == 3000.0
+        assert corpo["mes_anterior"]["faturamento"] == 2000.0
+        # Ano atual: jan a dez/2026 (só os meses que têm faturamento na lista).
+        assert corpo["ano_atual"]["faturamento"] == 5000.0
+        # Ano anterior: 2025 inteiro.
+        assert corpo["ano_anterior"]["faturamento"] == 4000.0
+
+    def test_periodo_do_recorte_fecha_mes_usa_a_janela(self, erp_mock):
+        # Sem `data_inicio`/`data_fim` a lista é o mês âncora: o faturamento do
+        # `periodo` é o da janela do mês, sem ir no intervalo.
+        chamadas = erp_mock(
+            [_linha(valor="150")],
+            [_serie_mes("2026-10", "150", 1)],
+            faturamento=[_faturamento_mes("2026-10", "3000")],
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        assert corpo["periodo"]["faturamento"] == 3000.0
+        tipos = [tipo for tipo, _ in chamadas]
+        assert "faturamento_intervalo" not in tipos
+
+    def test_recorte_arbitrario_usa_a_soma_do_intervalo(self, erp_mock):
+        # Trimestre/dia a dia: o faturamento vem da soma direta no intervalo, não da
+        # soma de meses inteiros (que inflaria o denominador).
+        chamadas = erp_mock(
+            [_linha(valor="350")],
+            [_serie_mes("2026-08", "350", 1)],
+            faturamento=[_faturamento_mes("2026-08", "9999")],
+            faturamento_intervalo="1234.56",
+        )
+        corpo = client.get(
+            "/contas-pagas-detalhe",
+            params={"data_inicio": "2026-08-15", "data_fim": "2026-09-10"},
+        ).json()
+
+        assert corpo["periodo"]["faturamento"] == 1234.56
+        janela_intervalo = [p for tipo, p in chamadas if tipo == "faturamento_intervalo"][0]
+        assert janela_intervalo == (date(2026, 8, 15), date(2026, 9, 11))
+
+    def test_sem_faturamento_no_periodo_e_zero(self, erp_mock):
+        erp_mock([_linha(valor="150")], [_serie_mes("2026-10", "150", 1)])
+        corpo = client.get(
+            "/contas-pagas-detalhe", params={"data": "2026-10-13"}
+        ).json()
+
+        assert corpo["mes"]["faturamento"] == 0.0
+        assert corpo["periodo"]["faturamento"] == 0.0
 
