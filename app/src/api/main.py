@@ -14,6 +14,7 @@ from src.api.routers import (
     faturamento_detalhe,
     infra,
     kpis,
+    wms,
 )
 from src.config import get_settings
 
@@ -43,3 +44,4 @@ app.include_router(kpis.router)
 app.include_router(faturamento_detalhe.router)
 app.include_router(custos_administrativos.router)
 app.include_router(contas_pagas_detalhe.router)
+app.include_router(wms.router)
