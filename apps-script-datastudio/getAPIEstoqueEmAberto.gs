@@ -8,10 +8,12 @@
  *
  *   1. A API nova exige login. O token sai de `POST /auth/login` (JSON {email, senha})
  *      e vai no header `Authorization: Bearer <token>` em todas as chamadas.
- *   2. A API nova é paginada: `/dados` devolve no máximo 10.000 peças por chamada.
+ *   2. A API nova é paginada: o endpoint devolve no máximo 10.000 peças por chamada.
  *      Aqui o script percorre as páginas com `offset` até vir uma página incompleta,
  *      então o resultado é a base completa (o legado devolvia tudo de uma vez).
- *   3. A baseURL, o email e a senha vêm preenchidos abaixo (usuário de serviço da
+ *   3. O endpoint `/dados-legado` devolve EXATAMENTE as colunas do legado, na mesma
+ *      ordem (Lote_Interno, Aviso, ... Linha) — o Data Studio não muda.
+ *   4. A baseURL, o email e a senha vêm preenchidos abaixo (usuário de serviço da
  *      api-microdata). Dá para sobrescrever sem editar o código pelas Propriedades
  *      do Script (Arquivo > Propriedades do projeto > Propriedades do script):
  *
@@ -19,10 +21,10 @@
  *        ESTOQUE_API_EMAIL  ex.: usuario@empresa.com.br
  *        ESTOQUE_API_SENHA  (a senha)
  *
- * Os nomes das colunas de negócio não mudaram (Largura, Metros, Peso continuam
- * numéricos), então a formatação da planilha segue igual.
+ * `COLUNAS_LEGADO` fixa a ordem de saída (não confia na ordem do JSON) e
+ * `CAMPOS_NUMERICOS` (Largura, Metros, Peso) replica a formatação do legado.
  *
- * Para trocar de aba/colunas, mexa só em NOME_ABA e CAMPOS_NUMERICOS.
+ * Para trocar de aba/colunas, mexa só em NOME_ABA, COLUNAS_LEGADO e CAMPOS_NUMERICOS.
  */
 
 function getAPIEstoqueEmAberto() {
@@ -32,6 +34,7 @@ function getAPIEstoqueEmAberto() {
   // =====================================================
 
   const NOME_ABA = 'ESTOQUE';
+  const CAMINHO = '/dados-legado'; // mesmo contrato do /dados do legado
   const TAMANHO_PAGINA = 10000; // teto da API nova (`limite` máx 10.000)
 
   // Usuário de serviço da api-microdata (mesmo das integrações do BI). O host é o
@@ -40,7 +43,32 @@ function getAPIEstoqueEmAberto() {
   const EMAIL_PADRAO = 'bi@dgbcomex.com';
   const SENHA_PADRAO = 'ozxQ7Vq4L2KpWnR8';
 
-  // Campos que devem ser tratados como números (nomes do retorno da API).
+  // Ordem e nomes das colunas do legado: a planilha/Data Studio depende disso.
+  const COLUNAS_LEGADO = [
+    'Lote_Interno',
+    'Aviso',
+    'Gaveta',
+    'SubLote',
+    'Situacao',
+    'Nro_Rolo',
+    'Nro_Peca',
+    'Produto',
+    'Categoria',
+    'Categoria_Tinto',
+    'Cor',
+    'Desenho',
+    'Variante',
+    'Largura',
+    'Metros',
+    'Peso',
+    'Rolo_Packlist',
+    'Data_Entrada',
+    'Chave',
+    'Num_Etq_Aux',
+    'Linha'
+  ];
+
+  // Campos que devem ser tratados como números (iguais ao legado).
   const CAMPOS_NUMERICOS = new Set([
     'Largura',
     'Metros',
@@ -92,7 +120,7 @@ function getAPIEstoqueEmAberto() {
     // 2. CONSULTA A API (paginada)
     // =====================================================
 
-    const data = buscarTodasAsPecas(URL_API, token, TAMANHO_PAGINA);
+    const data = buscarTodasAsPecas(URL_API, CAMINHO, token, TAMANHO_PAGINA);
 
     if (data.length === 0) {
       Logger.log('API retornou 0 registros. Planilha não alterada.');
@@ -104,7 +132,8 @@ function getAPIEstoqueEmAberto() {
     // 3. CABEÇALHOS
     // =====================================================
 
-    const headers = Object.keys(data[0]);
+    // Ordem fixa do legado: não depende da ordem das chaves do JSON.
+    const headers = COLUNAS_LEGADO;
 
     const qtdLinhas = data.length;
     const qtdColunas = headers.length;
@@ -336,10 +365,10 @@ function login(urlApi, email, senha) {
 
 
 /**
- * Percorre `/dados` com `offset` até vir uma página incompleta.
+ * Percorre `caminho` (ex.: `/dados-legado`) com `offset` até vir uma página incompleta.
  * A resposta é um array cru (uma peça por item), como no legado — só que em lotes.
  */
-function buscarTodasAsPecas(urlApi, token, tamanhoPagina) {
+function buscarTodasAsPecas(urlApi, caminho, token, tamanhoPagina) {
 
   const todas = [];
   let offset = 0;
@@ -347,7 +376,7 @@ function buscarTodasAsPecas(urlApi, token, tamanhoPagina) {
   while (true) {
 
     const url =
-      `${urlApi}/dados?limite=${tamanhoPagina}&offset=${offset}`;
+      `${urlApi}${caminho}?limite=${tamanhoPagina}&offset=${offset}`;
 
     const resposta = UrlFetchApp.fetch(url, {
       method: 'get',
@@ -359,7 +388,7 @@ function buscarTodasAsPecas(urlApi, token, tamanhoPagina) {
 
     if (status !== 200) {
       throw new Error(
-        `Erro na API /dados. HTTP ${status}: ${resposta.getContentText()}`
+        `Erro na API ${caminho}. HTTP ${status}: ${resposta.getContentText()}`
       );
     }
 

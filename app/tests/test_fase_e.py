@@ -52,6 +52,73 @@ class TestRotasPublicadas:
         assert client.get("/dados?limite=99999").status_code == 422
         assert client.get("/dados?limite=0").status_code == 422
 
+    def test_dados_legado_esta_publicado(self):
+        assert "/dados-legado" in app.openapi()["paths"]
+
+    def test_limite_do_dados_legado_e_limitado(self):
+        assert client.get("/dados-legado?limite=999999").status_code == 422
+        assert client.get("/dados-legado?limite=0").status_code == 422
+
+
+class TestDadosLegado:
+    """`/dados-legado`: mesmo contrato do `/dados` do oraculum (Data Studio/Planilha)."""
+
+    COLUNAS = [
+        "Lote_Interno",
+        "Aviso",
+        "Gaveta",
+        "SubLote",
+        "Situacao",
+        "Nro_Rolo",
+        "Nro_Peca",
+        "Produto",
+        "Categoria",
+        "Categoria_Tinto",
+        "Cor",
+        "Desenho",
+        "Variante",
+        "Largura",
+        "Metros",
+        "Peso",
+        "Rolo_Packlist",
+        "Data_Entrada",
+        "Chave",
+        "Num_Etq_Aux",
+        "Linha",
+    ]
+
+    def test_colunas_na_ordem_exata_do_legado(self):
+        corpo = client.get("/dados-legado?limite=2").json()
+        assert corpo, "o warehouse tem pecas em aberto"
+        assert list(corpo[0]) == self.COLUNAS
+
+    def test_chave_e_concatenacao_crua_sem_separador(self):
+        peca = client.get("/dados-legado?limite=1").json()[0]
+        assert peca["Chave"] == (
+            f"{peca['Nro_Rolo']}{peca['Situacao']}{peca['Cor']}{peca['Desenho']}"
+        )
+        assert "|" not in peca["Chave"]
+
+    def test_largura_e_texto_e_metros_peso_sao_numero(self):
+        """No legado `Largura` vinha da `Cte_Peca.Largura` (texto, ex.: `1,40`)."""
+        peca = client.get("/dados-legado?limite=1").json()[0]
+        assert isinstance(peca["Largura"], str)
+        assert isinstance(peca["Metros"], (int, float))
+        assert isinstance(peca["Peso"], (int, float))
+
+    def test_paginacao_nao_repete_nem_perde(self):
+        pagina1 = client.get("/dados-legado?limite=5&offset=0").json()
+        pagina2 = client.get("/dados-legado?limite=5&offset=5").json()
+        assert len(pagina1) == 5
+        chaves1 = {p["Chave"] for p in pagina1}
+        chaves2 = {p["Chave"] for p in pagina2}
+        # A Chave pode repetir entre pecas distintas (roda de negocio); o desempate
+        # por empresa/nro_peca garante posicoes distintas na paginacao.
+        assert [p["Nro_Peca"] for p in pagina1] != [p["Nro_Peca"] for p in pagina2] or (
+            pagina1 != pagina2
+        )
+        assert chaves1 and chaves2
+
 
 class TestJanelasDeData:
     def test_mes_seguinte_vira_ano(self):

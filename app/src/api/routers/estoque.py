@@ -98,6 +98,22 @@ def _normalizar(peca: dict[str, Any]) -> dict[str, Any]:
     return peca
 
 
+def _normalizar_legado(peca: dict[str, Any]) -> dict[str, Any]:
+    """Como o legado: só `Metros`/`Peso` são número (vieram de `CAST(... AS DECIMAL)`).
+
+    `Largura` vinha de `Cte_Peca.Largura`, que é texto (ex.: `'1,40'`) — o script que
+    consome isso trata a vírgula; converter aqui mudaria o dado. `Data_Entrada` sai em
+    ISO, igual às demais rotas.
+    """
+    for campo in ("Metros", "Peso"):
+        if peca.get(campo) is not None:
+            peca[campo] = float(peca[campo])
+    entrada = peca.get("Data_Entrada")
+    if entrada is not None and hasattr(entrada, "date"):
+        peca["Data_Entrada"] = entrada.date().isoformat()
+    return peca
+
+
 def _consultar(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     with warehouse.engine().connect() as conn:
         return [dict(linha) for linha in conn.execute(text(sql), params or {}).mappings()]
@@ -158,6 +174,119 @@ def dados(
         )
         saida.append(peca)
     return saida
+
+
+# Colunas e ordem do `/dados` legado (oraculum, `main.py`). O Data Studio/Planilha
+# consome exatamente estes nomes, entao a rota legado reproduz a lista — inclusive os
+# campos que nao existem no mart (`Lote_Interno`, `Aviso`, `SubLote`, `Categoria_Tinto`,
+# `Rolo_Packlist`, `Num_Etq_Aux`, `Linha`), puxados do `raw`.
+COLUNAS_LEGADO = (
+    "Lote_Interno",
+    "Aviso",
+    "Gaveta",
+    "SubLote",
+    "Situacao",
+    "Nro_Rolo",
+    "Nro_Peca",
+    "Produto",
+    "Categoria",
+    "Categoria_Tinto",
+    "Cor",
+    "Desenho",
+    "Variante",
+    "Largura",
+    "Metros",
+    "Peso",
+    "Rolo_Packlist",
+    "Data_Entrada",
+    "Chave",
+    "Num_Etq_Aux",
+    "Linha",
+)
+
+# `Chave` do legado: concatenacao crua (sem separador) de Nro_Rolo+Situacao+Cor+Desenho.
+SQL_DADOS_LEGADO = """
+select
+    a.lote_interno                                  as "Lote_Interno",
+    a.aviso                                         as "Aviso",
+    a.gaveta                                        as "Gaveta",
+    a.sub_lote                                      as "SubLote",
+    a.situacao                                      as "Situacao",
+    a.nro_rolo                                      as "Nro_Rolo",
+    a.nro_peca                                      as "Nro_Peca",
+    a.produto                                       as "Produto",
+    a.categoria                                     as "Categoria",
+    a.categoria_tinto                               as "Categoria_Tinto",
+    a.cor                                           as "Cor",
+    a.desenho                                       as "Desenho",
+    a.variante                                      as "Variante",
+    a.largura                                       as "Largura",
+    cast(a.metros as decimal(18, 2))                as "Metros",
+    cast(a.peso as decimal(18, 2))                  as "Peso",
+    a.tear                                          as "Rolo_Packlist",
+    a.data_entrada                                  as "Data_Entrada",
+    (a.nro_rolo || a.situacao || a.cor || a.desenho) as "Chave",
+    a.num_etq_aux                                   as "Num_Etq_Aux",
+    pt.linha                                        as "Linha"
+from raw.cte_peca a
+join raw.produtos_tecidos pt
+    on pt.empresa = a.emp_prod
+   and pt.produto = a.produto
+where not exists (
+    select 1
+    from raw.cte_baixa b
+    where b.empresa = a.empresa
+      and b.nro_rolo = a.nro_rolo
+      and b.nro_peca = a.nro_peca
+)
+  and a.nro_rolo_origem is null
+{empresa}
+order by
+    a.sub_lote asc,
+    a.tear asc,
+    a.gaveta asc,
+    a.produto asc,
+    a.cor asc,
+    a.aviso desc,
+    a.nro_rolo desc,
+    a.categoria_tinto asc,
+    a.empresa asc,
+    a.nro_peca asc
+limit :limite offset :offset
+"""
+
+
+@router.get("/dados-legado")
+def dados_legado(
+    usuario: _dependente,
+    empresa: str | None = Query(
+        None, description="Empresa (`char(2)`); só o admin pode pedir outra além da do token"
+    ),
+    limite: int = Query(10_000, ge=1, le=100_000),
+    offset: int = Query(0, ge=0),
+) -> list[dict[str, Any]]:
+    """`/dados` no **formato exato do legado** (nomes, ordem e `Chave` sem separador).
+
+    Serve o Data Studio/Planilha que consome o endpoint antigo do oraculum: os campos que
+    não existem no mart (`Lote_Interno`, `Aviso`, `SubLote`, `Categoria_Tinto`,
+    `Rolo_Packlist`, `Num_Etq_Aux`, `Linha`) vêm do `raw` (`cte_peca`/`produtos_tecidos`),
+    e a `Chave` é a concatenação crua `Nro_Rolo+Situacao+Cor+Desenho`, como no legado.
+
+    Diferenças conscientes em relação ao legado: há paginação (`limite`/`offset`) e a
+    ordenação ganha desempate por `Empresa`/`Nro_Peca` no fim, para a página não repetir
+    nem perder linha. O corte por empresa (D6) é o mesmo das outras rotas.
+    """
+    condicoes: list[str] = []
+    params: dict[str, Any] = {"limite": limite, "offset": offset}
+    empresa_do_token = empresa_efetiva(usuario, empresa)
+    if empresa_do_token:
+        condicoes.append("and a.empresa = :empresa")
+        params["empresa"] = empresa_do_token
+    sql = SQL_DADOS_LEGADO.format(empresa=" ".join(condicoes))
+    return [
+        _normalizar_legado({mapa: linha[mapa] for mapa in COLUNAS_LEGADO})
+        for linha in _consultar(sql, params)
+    ]
 
 
 def _texto(valor: Any) -> str:
