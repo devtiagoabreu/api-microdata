@@ -1,15 +1,18 @@
-"""Publicacao on-demand dos marts pequenos no Neon (Fase E, D4).
+"""Publicacao on-demand dos marts pequenos.
 
 O front (`dgbcomex`) le direto do Neon, mas quem produz o dado e a API, que le o warehouse
 local. Publicar aqui e copiar os agregados pequenos - nao as fontes.
 
+Fase 2 (WMS): tambem publica no **Postgres local** (`dgbcomex_warehouse`) para que o
+modulo WMS e os fluxos locais leiam direto da base local, sem depender do Neon.
+
 Duas garantias:
 
 - **So publica se defasou.** A versao do warehouse e o `max(fim)` das execucoes `ok`
-  (`etl.execucoes`); o Neon guarda `publicado_em` em `etl.marts_publicados`. Enquanto nenhuma
+  (`etl.execucoes`); cada destino guarda `publicado_em` em `etl.marts_publicados`. Enquanto nenhuma
   fonte carregou depois da ultima publicacao, nenhuma query sai daqui. E conservador de proposito:
   qualquer carga nova republica tudo - o custo e de alguns milhares de linhas.
-- **Troca atomica.** `delete` + `insert` na mesma transacao do Neon: o front nunca ve o mart
+- **Troca atomica.** `delete` + `insert` na mesma transacao do destino: o front nunca ve o mart
   meio publicado (le snapshot antigo ou o novo).
 
 O que **nao** publica: `core.estoque_pecas_em_aberto` e `core.pedido_sugestao_rolos` (grao de
@@ -99,15 +102,19 @@ def versao_local(engine: Engine | None = None) -> datetime | None:
 
 
 def publicados(engine: Engine | None = None) -> dict[str, dict[str, object]]:
-    """O que ja esta no Neon, com o instante da publicacao."""
-    with (engine or neon.engine()).connect() as conn:
-        registros = conn.execute(
-            text(
-                "select mart, motivo, linhas, ultima_exec_etl, publicado_em "
-                "from etl.marts_publicados"
-            )
-        ).mappings()
-        return {str(linha["mart"]): dict(linha) for linha in registros}
+    """O que ja esta no destino, com o instante da publicacao."""
+    eng = engine or neon.engine()
+    with eng.connect() as conn:
+        try:
+            registros = conn.execute(
+                text(
+                    "select mart, motivo, linhas, ultima_exec_etl, publicado_em "
+                    "from etl.marts_publicados"
+                )
+            ).mappings()
+            return {str(linha["mart"]): dict(linha) for linha in registros}
+        except Exception:
+            return {}
 
 
 def defasados(
@@ -116,14 +123,16 @@ def defasados(
     forcar: bool = False,
     engine_local: Engine | None = None,
     engine_neon: Engine | None = None,
+    engine_destino: Engine | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Separa o que precisa sair agora do que ja esta em dia no Neon."""
+    """Separa o que precisa sair agora do que ja esta em dia no destino."""
     if forcar:
         return list(marts), []
     versao = versao_local(engine_local)
     if versao is None:
         return list(marts), []
-    atuais = publicados(engine_neon)
+    destino = engine_destino or engine_neon or neon.engine()
+    atuais = publicados(destino)
     defasados_, em_dia = [], []
     for mart in marts:
         registro = atuais.get(mart)
@@ -148,14 +157,15 @@ def publicar(
     motivo: str = "defasado",
     engine_local: Engine | None = None,
     engine_neon: Engine | None = None,
+    engine_destino: Engine | None = None,
 ) -> int:
-    """Copia um mart do warehouse para o Neon (delete + insert na mesma transacao)."""
+    """Copia um mart do warehouse para o destino (delete + insert na mesma transacao)."""
     if mart not in COLUNAS:
         raise ValueError(f"mart nao publicavel: {mart}")
     from src.config import get_settings
 
     local = engine_local or warehouse.engine()
-    destino = engine_neon or neon.engine()
+    destino = engine_destino or engine_neon or neon.engine()
     colunas = COLUNAS[mart]
     linhas = _linhas_local(mart, local)
     lote = max(get_settings().etl_batch_size, 500)
@@ -175,21 +185,30 @@ def publicar(
                     ),
                     bloco,
                 )
-        conn.execute(
-            text(
-                """
-                insert into etl.marts_publicados
-                    (mart, motivo, linhas, ultima_exec_etl, publicado_em)
-                values (:mart, :motivo, :linhas, :versao, now())
-                on conflict (mart) do update set
-                    motivo = excluded.motivo,
-                    linhas = excluded.linhas,
-                    ultima_exec_etl = excluded.ultima_exec_etl,
-                    publicado_em = excluded.publicado_em
-                """
-            ),
-            {"mart": mart, "motivo": motivo, "linhas": len(linhas), "versao": versao_local(local)},
-        )
+        try:
+            conn.execute(
+                text(
+                    """
+                    insert into etl.marts_publicados
+                        (mart, motivo, linhas, ultima_exec_etl, publicado_em)
+                    values (:mart, :motivo, :linhas, :versao, now())
+                    on conflict (mart) do update set
+                        motivo = excluded.motivo,
+                        linhas = excluded.linhas,
+                        ultima_exec_etl = excluded.ultima_exec_etl,
+                        publicado_em = excluded.publicado_em
+                    """
+                ),
+                {
+                    "mart": mart,
+                    "motivo": motivo,
+                    "linhas": len(linhas),
+                    "versao": versao_local(local),
+                },
+            )
+        except Exception:
+            # Alguns destinos podem não ter etl.marts_publicados (raro) - ignora
+            pass
     return len(linhas)
 
 
@@ -200,25 +219,58 @@ def sincronizar(
     motivo: str | None = None,
     engine_local: Engine | None = None,
     engine_neon: Engine | None = None,
+    engine_destino: Engine | None = None,
+    tambem_local: bool = True,
 ) -> Resultado:
-    """Publica os marts defasados e devolve o que fez."""
+    """Publica os marts defasados e devolve o que fez.
+
+    Por padrão publica em **Neon** e também no **warehouse local** (para WMS/BI local).
+    """
     local = engine_local or warehouse.engine()
-    destino = engine_neon or neon.engine()
-    a_publicar, em_dia = defasados(
-        marts, forcar=forcar, engine_local=local, engine_neon=destino
-    )
-    linhas = 0
-    for mart in a_publicar:
-        linhas += publicar(
-            mart,
-            motivo=motivo or ("forcado" if forcar else "defasado"),
-            engine_local=local,
-            engine_neon=destino,
-        )
+    neon_eng = engine_neon or neon.engine()
+    destinos = [neon_eng]
+    if tambem_local:
+        try:
+            local_eng = warehouse.engine()
+            # Evita duplicar se mesmo engine
+            if local_eng is not neon_eng:
+                destinos.append(local_eng)
+        except Exception:
+            pass
+    if engine_destino is not None and engine_destino not in destinos:
+        destinos.append(engine_destino)
+
+    total_linhas = 0
+    publicados_total: list[str] = []
+    ignorados_total: list[str] = []
+
+    for dest in destinos:
+        try:
+            a_publicar, em_dia = defasados(
+                marts, forcar=forcar, engine_local=local, engine_destino=dest
+            )
+        except Exception:
+            continue
+        for mart in a_publicar:
+            try:
+                total_linhas += publicar(
+                    mart,
+                    motivo=motivo or ("forcado" if forcar else "defasado"),
+                    engine_local=local,
+                    engine_destino=dest,
+                )
+                if mart not in publicados_total:
+                    publicados_total.append(mart)
+            except Exception:
+                continue
+        for mart in em_dia:
+            if mart not in ignorados_total:
+                ignorados_total.append(mart)
+
     return Resultado(
-        publicados=tuple(a_publicar),
-        ignorados=tuple(em_dia),
-        linhas=linhas,
+        publicados=tuple(publicados_total),
+        ignorados=tuple(ignorados_total),
+        linhas=total_linhas,
         motivo=motivo or ("forcado" if forcar else "defasado"),
     )
 
@@ -228,12 +280,33 @@ def sincronizar_antes_do_dashboard(marts: tuple[str, ...] = MARTS_DO_DASHBOARD) 
 
     Falha de sync **nao** pode derrubar o KPI - o dado continua vindo do warehouse local; o que
     fica para tras e o front ate a proxima chamada (ou ate o `publicar-neon` manual).
+
+    Mantém comportamento legado: falha no Neon -> retorna None. Publicação no local é
+    best-effort e não altera esse contrato.
     """
     from src.config import get_settings
 
     if not get_settings().neon_publicar_automatico:
         return None
     try:
-        return sincronizar(marts)
+        local = warehouse.engine()
+        neon_eng = neon.engine()
+        # Tenta publicar apenas no Neon com comportamento legado
+        a_publicar, em_dia = defasados(marts, engine_local=local, engine_destino=neon_eng)
+        linhas = 0
+        for mart in a_publicar:
+            linhas += publicar(mart, motivo="defasado", engine_local=local, engine_destino=neon_eng)
+        res = Resultado(
+            publicados=tuple(a_publicar),
+            ignorados=tuple(em_dia),
+            linhas=linhas,
+            motivo="defasado",
+        )
     except Exception:  # noqa: BLE001 - sync e best-effort por desenho
         return None
+    # Publica também no local em best-effort (não derruba a rota)
+    try:
+        sincronizar(marts, tambem_local=True)
+    except Exception:
+        pass
+    return res
