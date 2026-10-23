@@ -22,6 +22,8 @@ autorizacao por usuario final fica no dgbcomex; aqui a API confia no token de se
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -45,6 +47,21 @@ STATUS_CANCELADO = "CANCELADO"
 STATUS_ATIVOS = (STATUS_LIBERADO, STATUS_EM_SEPARACAO)
 STATUS_PECA_ATIVA = ("RESERVADA", "SEPARADA")
 LIMITE_MAX = 500
+
+ACAO_NENHUMA = "NENHUMA"
+ACAO_CRIAR = "CRIAR_ORDEM"
+ACAO_CONCLUIR = "CONCLUIR_ORDEM"
+ACAO_CANCELAR = "CANCELAR_ORDEM"
+ACOES_SITUACAO = (ACAO_NENHUMA, ACAO_CRIAR, ACAO_CONCLUIR, ACAO_CANCELAR)
+CAMPOS_BUSCA_PECA = {
+    "lote": "sub_lote",
+    "sublote": "sub_lote",
+    "sub_lote": "sub_lote",
+    "aviso": "aviso",
+    "gaveta": "gaveta",
+    "endereco": "gaveta",
+}
+COR_PADRAO = "#94a3b8"
 
 # Uma peca peca pode estar em uma unica ordem enquanto reservada/separada. Depois da baixa
 # no ERP ela some do estoque em aberto; a linha continua no historico da ordem.
@@ -103,6 +120,32 @@ class AdicionarPecas(Modelo):
     item: int
     pecas: list[PecaRef] = Field(min_length=1)
     usuario_id: int | None = None
+
+
+class MoverSituacao(Modelo):
+    situacao_id: int
+    usuario_id: int | None = None
+    observacao: str | None = None
+    cancelar_ordem: bool = False
+
+
+class NovaSituacao(Modelo):
+    codigo: str | None = None
+    nome: str
+    cor: str = COR_PADRAO
+    ordem: int = 0
+    acao: str = ACAO_NENHUMA
+    perfis: list[str] = Field(default_factory=list)
+    ativo: bool = True
+
+
+class EdicaoSituacao(Modelo):
+    nome: str | None = None
+    cor: str | None = None
+    ordem: int | None = None
+    acao: str | None = None
+    perfis: list[str] | None = None
+    ativo: bool | None = None
 
 
 def _texto(valor: str | None) -> str | None:
@@ -199,6 +242,233 @@ def _gaveta(linha: Any) -> dict[str, Any]:
         "pecas": linha["pecas"],
         "metros": _float0(linha["metros"]),
     }
+
+
+def _slug(valor: str) -> str:
+    sem_acento = unicodedata.normalize("NFKD", valor).encode("ascii", "ignore").decode()
+    limpo = re.sub(r"[^A-Za-z0-9]+", "_", sem_acento).strip("_")
+    return limpo.upper()
+
+
+def _situacao(linha: Any) -> dict[str, Any]:
+    return {
+        "id": linha["id"],
+        "codigo": linha["codigo"],
+        "nome": linha["nome"],
+        "cor": linha["cor"],
+        "ordem": linha["ordem"],
+        "acao": linha["acao"],
+        "perfis": list(linha["perfis"] or []),
+        "ativo": bool(linha["ativo"]),
+        "sistema": bool(linha["sistema"]),
+        "pedidos": linha["pedidos"] if "pedidos" in linha else None,
+        "criadoEm": _data(linha["criado_em"]),
+        "atualizadoEm": _data(linha["atualizado_em"]),
+    }
+
+
+def _situacao_por_id(conn: Any, situacao_id: int) -> Any:
+    linha = conn.execute(
+        text(
+            """
+            select
+                s.*,
+                (
+                    select count(*)::int
+                    from public.wms_pedidos_situacao ps
+                    where ps.situacao_id = s.id
+                ) as pedidos
+            from public.wms_situacoes_pedido s
+            where s.id = :id
+            """
+        ),
+        {"id": situacao_id},
+    ).mappings().first()
+    if linha is None:
+        raise HTTPException(status_code=404, detail="Situação do pedido não encontrada")
+    return linha
+
+
+def _situacao_por_codigo(conn: Any, codigo: str) -> Any:
+    return conn.execute(
+        text("select * from public.wms_situacoes_pedido where codigo = :codigo"),
+        {"codigo": codigo},
+    ).mappings().first()
+
+
+def _situacao_atual(conn: Any, empresa: str, pedido: str) -> Any:
+    return conn.execute(
+        text(
+            """
+            select
+                s.*,
+                ps.atualizado_por,
+                ps.atualizado_em
+            from public.wms_pedidos_situacao ps
+            join public.wms_situacoes_pedido s on s.id = ps.situacao_id
+            where ps.empresa = :empresa and ps.pedido = :pedido
+            """
+        ),
+        {"empresa": empresa, "pedido": pedido},
+    ).mappings().first()
+
+
+def _definir_situacao(
+    conn: Any,
+    empresa: str,
+    pedido: str,
+    codigo: str,
+    *,
+    usuario_id: int | None = None,
+    observacao: str | None = None,
+) -> dict[str, Any] | None:
+    """Sincroniza a situacao local do pedido (kanban) com o codigo pedido."""
+    nova = _situacao_por_codigo(conn, codigo)
+    if nova is None:
+        return None
+    atual = _situacao_atual(conn, empresa, pedido)
+    anterior_id = atual["id"] if atual is not None else None
+    if anterior_id == nova["id"]:
+        return _situacao(nova)
+    conn.execute(
+        text(
+            """
+            insert into public.wms_pedidos_situacao
+                (empresa, pedido, situacao_id, atualizado_por, atualizado_em)
+            values
+                (:empresa, :pedido, :situacao_id, :usuario_id, now())
+            on conflict (empresa, pedido) do update
+                set situacao_id = excluded.situacao_id,
+                    atualizado_por = excluded.atualizado_por,
+                    atualizado_em = now()
+            """
+        ),
+        {
+            "empresa": empresa,
+            "pedido": pedido,
+            "situacao_id": nova["id"],
+            "usuario_id": usuario_id,
+        },
+    )
+    conn.execute(
+        text(
+            """
+            insert into public.wms_pedido_eventos
+                (empresa, pedido, situacao_anterior_id, situacao_nova_id,
+                 usuario_id, observacao)
+            values
+                (:empresa, :pedido, :anterior_id, :nova_id, :usuario_id, :observacao)
+            """
+        ),
+        {
+            "empresa": empresa,
+            "pedido": pedido,
+            "anterior_id": anterior_id,
+            "nova_id": nova["id"],
+            "usuario_id": usuario_id,
+            "observacao": _texto(observacao),
+        },
+    )
+    return _situacao(nova)
+
+
+def _pedido_erp(conn: Any, empresa: str, pedido: str) -> Any:
+    return conn.execute(
+        text(
+            """
+            select
+                p.empresa,
+                p.pedido,
+                p.cliente,
+                c.razao_nome_cliente,
+                to_char(p.data_pedido, 'YYYY-MM-DD') as data_pedido,
+                to_char(p.data_entrega, 'YYYY-MM-DD') as data_entrega,
+                p.status,
+                p.status_ped,
+                cast(
+                    coalesce(
+                        (
+                            select sum(
+                                greatest(
+                                    i.qtde
+                                    - coalesce(i.qtde_romaneio, 0)
+                                    - coalesce(i.qtde_acerto, 0),
+                                    0
+                                )
+                            )
+                            from raw.car_itens_pedido i
+                            where i.empresa = p.empresa
+                              and i.pedido = p.pedido
+                              and coalesce(i.status_item, '') <> 'E'
+                        ),
+                        0
+                    ) as double precision
+                ) as saldo
+            from raw.car_pedido p
+            left join raw.clientes_principal c on c.codigo_cliente = p.cliente
+            where p.empresa = :empresa and p.pedido = :pedido
+            """
+        ),
+        {"empresa": empresa, "pedido": pedido},
+    ).mappings().first()
+
+
+def _ordem_ativa(conn: Any, empresa: str, pedido: str) -> Any:
+    return conn.execute(
+        text(
+            """
+            select *
+            from public.wms_separacoes
+            where empresa = :empresa
+              and pedido = :pedido
+              and status in ('LIBERADO', 'EM_SEPARACAO')
+            order by id desc
+            limit 1
+            """
+        ),
+        {"empresa": empresa, "pedido": pedido},
+    ).mappings().first()
+
+
+def _criar_ordem(
+    conn: Any,
+    cabecalho: Any,
+    *,
+    status_ordem: str,
+    usuario_id: int | None,
+    observacao: str | None = None,
+) -> int:
+    return conn.execute(
+        text(
+            """
+            insert into public.wms_separacoes (
+                empresa, pedido, status, cliente_codigo, cliente_nome,
+                data_pedido, data_entrega, observacao, criado_por,
+                iniciado_por, iniciado_em, concluido_por, cancelado_por
+            ) values (
+                :empresa, :pedido, :status, :cliente_codigo, :cliente_nome,
+                :data_pedido, :data_entrega, :observacao, :criado_por,
+                case when :status_ref = 'EM_SEPARACAO' then :iniciado_por else null end,
+                case when :status_ref = 'EM_SEPARACAO' then now() else null end,
+                null, null
+            )
+            returning id
+            """
+        ),
+        {
+            "empresa": cabecalho["empresa"],
+            "pedido": cabecalho["pedido"],
+            "status": status_ordem,
+            "status_ref": status_ordem,
+            "cliente_codigo": cabecalho["cliente"],
+            "cliente_nome": cabecalho["razao_nome_cliente"],
+            "data_pedido": cabecalho["data_pedido"],
+            "data_entrega": cabecalho["data_entrega"],
+            "observacao": _texto(observacao),
+            "criado_por": usuario_id,
+            "iniciado_por": usuario_id,
+        },
+    ).scalar_one()
 
 
 def _evento(
@@ -323,7 +593,9 @@ def _filtros_pedido(
         )
         params["busca"] = f"%{busca}%"
     if status_separacao:
-        condicoes.append("coalesce(s.status, 'SEM_SEPARACAO') = :status_separacao")
+        condicoes.append(
+            "coalesce(st.codigo, 'SEM_SEPARACAO') = :status_separacao"
+        )
         params["status_separacao"] = status_separacao
     return (" and " + " and ".join(condicoes) if condicoes else ""), params
 
@@ -353,11 +625,20 @@ select
         ) as double precision
     )                                      as saldo_metros,
     s.id                                   as separacao_id,
-    s.status                               as separacao_status
+    coalesce(st.codigo, 'SEM_SEPARACAO')   as situacao_codigo,
+    st.id                                  as situacao_id,
+    st.nome                                as situacao_nome,
+    st.cor                                 as situacao_cor,
+    st.ordem                               as situacao_ordem,
+    st.acao                                as situacao_acao,
+    st.perfis                              as situacao_perfis
 from raw.car_pedido p
 join raw.car_itens_pedido i
   on i.empresa = p.empresa and i.pedido = p.pedido
 left join raw.clientes_principal c on c.codigo_cliente = p.cliente
+left join public.wms_pedidos_situacao ps
+  on ps.empresa = p.empresa and ps.pedido = p.pedido
+left join public.wms_situacoes_pedido st on st.id = ps.situacao_id
 left join lateral (
     select s2.id, s2.status
     from public.wms_separacoes s2
@@ -377,7 +658,8 @@ where p.status = '2'
 group by
     p.empresa, p.pedido, p.cliente, c.razao_nome_cliente,
     p.data_pedido, p.data_entrega, p.status, p.status_ped,
-    s.id, s.status
+    s.id, s.status,
+    st.id, st.codigo, st.nome, st.cor, st.ordem, st.acao, st.perfis
 order by p.data_pedido desc, p.pedido desc
 limit :limite offset :offset
 """
@@ -385,11 +667,14 @@ limit :limite offset :offset
 SQL_CONTAR_PEDIDOS = """
 select count(*)::int
 from (
-    select p.empresa, p.pedido, s.id, s.status
+    select p.empresa, p.pedido, s.id, s.status, st.codigo
     from raw.car_pedido p
     join raw.car_itens_pedido i
       on i.empresa = p.empresa and i.pedido = p.pedido
     left join raw.clientes_principal c on c.codigo_cliente = p.cliente
+    left join public.wms_pedidos_situacao ps
+      on ps.empresa = p.empresa and ps.pedido = p.pedido
+    left join public.wms_situacoes_pedido st on st.id = ps.situacao_id
     left join lateral (
         select s2.id, s2.status
         from public.wms_separacoes s2
@@ -406,7 +691,7 @@ from (
           i.qtde - coalesce(i.qtde_romaneio, 0) - coalesce(i.qtde_acerto, 0)
       ) > 0
       {filtros}
-    group by p.empresa, p.pedido, s.id, s.status
+    group by p.empresa, p.pedido, s.id, s.status, st.codigo
 ) t
 """
 
@@ -435,12 +720,13 @@ def dashboard(usuario: _dependente) -> dict[str, Any]:
                 """
             )
         ).scalar_one()
-        ordens = conn.execute(
+        situacoes = conn.execute(
             text(
                 """
-                select status, count(*)::int
-                from public.wms_separacoes
-                group by status
+                select st.codigo, count(*)::int
+                from public.wms_pedidos_situacao ps
+                join public.wms_situacoes_pedido st on st.id = ps.situacao_id
+                group by st.codigo
                 """
             )
         ).all()
@@ -455,7 +741,7 @@ def dashboard(usuario: _dependente) -> dict[str, Any]:
         ).scalar_one()
         gavetas = conn.execute(text("select count(*)::int from raw.cte_gaveta")).scalar_one()
 
-    por_status = {linha[0]: linha[1] for linha in ordens}
+    por_status = {linha[0]: linha[1] for linha in situacoes}
     return {
         "pedidosLiberados": pedidos,
         "separacoesLiberadas": por_status.get(STATUS_LIBERADO, 0),
@@ -558,7 +844,13 @@ def listar_pedidos(
                 "totalItens": linha["total_itens"],
                 "saldoMetros": _float0(linha["saldo_metros"]),
                 "separacaoId": linha["separacao_id"],
-                "separacaoStatus": linha["separacao_status"] or "SEM_SEPARACAO",
+                "separacaoStatus": linha["situacao_codigo"] or "SEM_SEPARACAO",
+                "situacaoId": linha["situacao_id"],
+                "situacaoNome": linha["situacao_nome"],
+                "situacaoCor": linha["situacao_cor"],
+                "situacaoOrdem": linha["situacao_ordem"],
+                "situacaoAcao": linha["situacao_acao"],
+                "situacaoPerfis": list(linha["situacao_perfis"] or []),
             }
             for linha in conn.execute(
                 text(SQL_PEDIDOS.format(filtros=filtro)), params
@@ -702,6 +994,7 @@ def _pedido(conn: Any, empresa: str, pedido: str) -> dict[str, Any]:
         ),
         {"empresa": empresa, "pedido": pedido},
     ).mappings().first()
+    situacao = _situacao_atual(conn, empresa, pedido)
     return {
         "empresa": linha["empresa"],
         "pedido": linha["pedido"],
@@ -712,7 +1005,13 @@ def _pedido(conn: Any, empresa: str, pedido: str) -> dict[str, Any]:
         "status": linha["status"],
         "statusPed": linha["status_ped"],
         "separacaoId": separacao["id"] if separacao else None,
-        "separacaoStatus": separacao["status"] if separacao else "SEM_SEPARACAO",
+        "separacaoStatus": situacao["codigo"] if situacao else "SEM_SEPARACAO",
+        "situacaoId": situacao["id"] if situacao else None,
+        "situacaoNome": situacao["nome"] if situacao else None,
+        "situacaoCor": situacao["cor"] if situacao else None,
+        "situacaoOrdem": situacao["ordem"] if situacao else None,
+        "situacaoAcao": situacao["acao"] if situacao else None,
+        "situacaoPerfis": list(situacao["perfis"] or []) if situacao else [],
         "itens": _itens_pedido(conn, empresa, pedido),
     }
 
@@ -721,6 +1020,397 @@ def _pedido(conn: Any, empresa: str, pedido: str) -> dict[str, Any]:
 def detalhe_pedido(empresa: str, pedido: str, usuario: _dependente) -> dict[str, Any]:
     """Pedido com itens, saldo e o que ja esta reservado/separado no WMS."""
     with warehouse.engine().connect() as conn:
+        return _pedido(conn, empresa, pedido)
+
+
+def _validar_cor(cor: str) -> str:
+    valor = (cor or "").strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", valor):
+        raise HTTPException(status_code=400, detail="Cor deve estar no formato #RRGGBB")
+    return valor.lower()
+
+
+def _normalizar_perfis(perfis: list[str]) -> list[str]:
+    vistos: list[str] = []
+    for perfil in perfis:
+        nome = _slug(perfil or "")
+        if nome and nome not in vistos:
+            vistos.append(nome)
+    return vistos
+
+
+def _validar_acao(acao: str) -> str:
+    valor = (acao or "").strip().upper()
+    if valor not in ACOES_SITUACAO:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ação inválida. Use: {', '.join(ACOES_SITUACAO)}",
+        )
+    return valor
+
+
+@router.get("/wms/situacoes")
+def listar_situacoes(
+    usuario: _dependente,
+    ativo: bool | None = Query(None, description="Filtra por situações ativas/inativas"),
+) -> dict[str, Any]:
+    """Cadastro de situações do pedido: cada situação ativa é uma coluna do kanban."""
+    condicao = "" if ativo is None else "where s.ativo = :ativo"
+    params: dict[str, Any] = {} if ativo is None else {"ativo": ativo}
+    with warehouse.engine().connect() as conn:
+        itens = [
+            _situacao(linha)
+            for linha in conn.execute(
+                text(
+                    f"""
+                    select
+                        s.*,
+                        (
+                            select count(*)::int
+                            from public.wms_pedidos_situacao ps
+                            where ps.situacao_id = s.id
+                        ) as pedidos
+                    from public.wms_situacoes_pedido s
+                    {condicao}
+                    order by s.ordem, s.id
+                    """
+                ),
+                params,
+            ).mappings()
+        ]
+    return {"itens": itens, "total": len(itens)}
+
+
+@router.get("/wms/situacoes/{situacao_id}")
+def detalhe_situacao(situacao_id: int, usuario: _dependente) -> dict[str, Any]:
+    with warehouse.engine().connect() as conn:
+        return _situacao(_situacao_por_id(conn, situacao_id))
+
+
+@router.post("/wms/situacoes", status_code=status.HTTP_201_CREATED)
+def criar_situacao(dados: NovaSituacao, usuario: _dependente) -> dict[str, Any]:
+    nome = _texto(dados.nome)
+    if nome is None:
+        raise HTTPException(status_code=400, detail="Nome é obrigatório")
+    codigo = _slug(dados.codigo or nome)
+    if not codigo:
+        raise HTTPException(status_code=400, detail="Código inválido")
+    cor = _validar_cor(dados.cor)
+    acao = _validar_acao(dados.acao)
+    perfis = _normalizar_perfis(dados.perfis)
+
+    with warehouse.engine().begin() as conn:
+        try:
+            novo_id = conn.execute(
+                text(
+                    """
+                    insert into public.wms_situacoes_pedido
+                        (codigo, nome, cor, ordem, acao, perfis, ativo, sistema)
+                    values
+                        (:codigo, :nome, :cor, :ordem, :acao, :perfis, :ativo, false)
+                    returning id
+                    """
+                ),
+                {
+                    "codigo": codigo,
+                    "nome": nome,
+                    "cor": cor,
+                    "ordem": dados.ordem,
+                    "acao": acao,
+                    "perfis": perfis,
+                    "ativo": dados.ativo,
+                },
+            ).scalar_one()
+        except IntegrityError as erro:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Já existe uma situação com esse código",
+            ) from erro
+        return _situacao(_situacao_por_id(conn, novo_id))
+
+
+@router.put("/wms/situacoes/{situacao_id}")
+def atualizar_situacao(
+    situacao_id: int, dados: EdicaoSituacao, usuario: _dependente
+) -> dict[str, Any]:
+    campos: list[str] = []
+    params: dict[str, Any] = {"id": situacao_id}
+    if dados.nome is not None:
+        nome = _texto(dados.nome)
+        if nome is None:
+            raise HTTPException(status_code=400, detail="Nome é obrigatório")
+        campos.append("nome = :nome")
+        params["nome"] = nome
+    if dados.cor is not None:
+        campos.append("cor = :cor")
+        params["cor"] = _validar_cor(dados.cor)
+    if dados.ordem is not None:
+        campos.append("ordem = :ordem")
+        params["ordem"] = dados.ordem
+    if dados.acao is not None:
+        campos.append("acao = :acao")
+        params["acao"] = _validar_acao(dados.acao)
+    if dados.perfis is not None:
+        campos.append("perfis = :perfis")
+        params["perfis"] = _normalizar_perfis(dados.perfis)
+
+    with warehouse.engine().begin() as conn:
+        atual = _situacao_por_id(conn, situacao_id)
+        if dados.ativo is not None and not dados.ativo and atual["pedidos"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Situação em uso: mova os pedidos antes de desativá-la",
+            )
+        if dados.ativo is not None:
+            campos.append("ativo = :ativo")
+            params["ativo"] = dados.ativo
+        if campos:
+            conn.execute(
+                text(
+                    f"""
+                    update public.wms_situacoes_pedido
+                    set {", ".join(campos)}, atualizado_em = now()
+                    where id = :id
+                    """
+                ),
+                params,
+            )
+        return _situacao(_situacao_por_id(conn, situacao_id))
+
+
+@router.delete("/wms/situacoes/{situacao_id}")
+def excluir_situacao(situacao_id: int, usuario: _dependente) -> dict[str, Any]:
+    with warehouse.engine().begin() as conn:
+        atual = _situacao_por_id(conn, situacao_id)
+        if atual["sistema"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Situação padrão do sistema não pode ser excluída",
+            )
+        if atual["pedidos"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Situação em uso: mova os pedidos antes de excluí-la",
+            )
+        conn.execute(
+            text("delete from public.wms_situacoes_pedido where id = :id"),
+            {"id": situacao_id},
+        )
+    return {"id": situacao_id, "excluida": True}
+
+
+@router.post("/wms/pedidos/{empresa}/{pedido}/situacao")
+def mover_pedido_situacao(
+    empresa: str, pedido: str, dados: MoverSituacao, usuario: _dependente
+) -> dict[str, Any]:
+    """Move o pedido no kanban. A situação é local; a coluna define a ação no WMS."""
+    empresa = (empresa or "").strip()
+    pedido = (pedido or "").strip()
+    with warehouse.engine().begin() as conn:
+        cabecalho = _pedido_erp(conn, empresa, pedido)
+        if cabecalho is None:
+            raise HTTPException(status_code=404, detail="Pedido não encontrado")
+
+        alvo = _situacao(_situacao_por_id(conn, dados.situacao_id))
+        if not alvo["ativo"]:
+            raise HTTPException(status_code=400, detail="Situação do pedido está inativa")
+        if alvo["codigo"] in (STATUS_LIBERADO, STATUS_EM_SEPARACAO):
+            if (
+                cabecalho["status"] != "2"
+                or (cabecalho["status_ped"] or "") == "E"
+                or float(cabecalho["saldo"] or 0) <= 0
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Pedido não está liberado (aprovado e aberto) no ERP",
+                )
+
+        ordem = _ordem_ativa(conn, empresa, pedido)
+        acao = alvo["acao"]
+
+        if acao == ACAO_CRIAR:
+            if ordem is None:
+                nova_ordem = _criar_ordem(
+                    conn,
+                    cabecalho,
+                    status_ordem=STATUS_EM_SEPARACAO,
+                    usuario_id=dados.usuario_id,
+                    observacao=dados.observacao,
+                )
+                _evento(
+                    conn,
+                    nova_ordem,
+                    "INICIADA",
+                    descricao=_texto(dados.observacao) or "Criada ao mover no kanban",
+                    usuario_id=dados.usuario_id,
+                )
+            elif ordem["status"] == STATUS_LIBERADO:
+                conn.execute(
+                    text(
+                        """
+                        update public.wms_separacoes
+                        set status = 'EM_SEPARACAO',
+                            iniciado_por = coalesce(iniciado_por, :usuario_id),
+                            iniciado_em = coalesce(iniciado_em, now()),
+                            atualizado_em = now()
+                        where id = :id
+                        """
+                    ),
+                    {"id": ordem["id"], "usuario_id": dados.usuario_id},
+                )
+                _evento(
+                    conn,
+                    ordem["id"],
+                    "INICIADA",
+                    descricao=_texto(dados.observacao),
+                    usuario_id=dados.usuario_id,
+                )
+        elif acao == ACAO_CONCLUIR:
+            if ordem is None:
+                separada = conn.execute(
+                    text(
+                        """
+                        select 1
+                        from public.wms_separacoes
+                        where empresa = :empresa and pedido = :pedido
+                          and status = 'SEPARADO'
+                        limit 1
+                        """
+                    ),
+                    {"empresa": empresa, "pedido": pedido},
+                ).first()
+                if separada is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Pedido não possui ordem em separação para concluir",
+                    )
+            else:
+                pecas = conn.execute(
+                    text(
+                        "select count(*)::int from public.wms_separacao_pecas "
+                        "where separacao_id = :id"
+                    ),
+                    {"id": ordem["id"]},
+                ).scalar_one()
+                if pecas == 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Selecione ao menos uma peça antes de concluir",
+                    )
+                conn.execute(
+                    text(
+                        """
+                        update public.wms_separacao_pecas
+                        set status = 'SEPARADA', updated_at = now()
+                        where separacao_id = :id
+                        """
+                    ),
+                    {"id": ordem["id"]},
+                )
+                conn.execute(
+                    text(
+                        """
+                        update public.wms_separacoes
+                        set status = 'SEPARADO',
+                            iniciado_por = coalesce(iniciado_por, :usuario_id),
+                            iniciado_em = coalesce(iniciado_em, now()),
+                            concluido_por = :usuario_id,
+                            concluido_em = now(),
+                            atualizado_em = now()
+                        where id = :id
+                        """
+                    ),
+                    {"id": ordem["id"], "usuario_id": dados.usuario_id},
+                )
+                _evento(
+                    conn,
+                    ordem["id"],
+                    "CONCLUIDA",
+                    descricao=_texto(dados.observacao),
+                    usuario_id=dados.usuario_id,
+                    payload={"pecas": pecas},
+                )
+        elif acao == ACAO_CANCELAR:
+            if ordem is not None:
+                pecas = conn.execute(
+                    text(
+                        "delete from public.wms_separacao_pecas "
+                        "where separacao_id = :id returning id"
+                    ),
+                    {"id": ordem["id"]},
+                ).all()
+                conn.execute(
+                    text(
+                        """
+                        update public.wms_separacoes
+                        set status = 'CANCELADO',
+                            motivo_cancelamento = :motivo,
+                            cancelado_por = :usuario_id,
+                            cancelado_em = now(),
+                            atualizado_em = now()
+                        where id = :id
+                        """
+                    ),
+                    {
+                        "id": ordem["id"],
+                        "motivo": _texto(dados.observacao),
+                        "usuario_id": dados.usuario_id,
+                    },
+                )
+                _evento(
+                    conn,
+                    ordem["id"],
+                    "CANCELADA",
+                    descricao=_texto(dados.observacao),
+                    usuario_id=dados.usuario_id,
+                    payload={"pecasLiberadas": len(pecas)},
+                )
+        else:
+            if ordem is not None:
+                pecas = conn.execute(
+                    text(
+                        "select count(*)::int from public.wms_separacao_pecas "
+                        "where separacao_id = :id"
+                    ),
+                    {"id": ordem["id"]},
+                ).scalar_one()
+                if alvo["codigo"] == STATUS_LIBERADO and pecas == 0:
+                    conn.execute(
+                        text(
+                            """
+                            update public.wms_separacoes
+                            set status = 'LIBERADO',
+                                iniciado_por = null,
+                                iniciado_em = null,
+                                atualizado_em = now()
+                            where id = :id
+                            """
+                        ),
+                        {"id": ordem["id"]},
+                    )
+                    _evento(
+                        conn,
+                        ordem["id"],
+                        "LIBERADA",
+                        descricao=_texto(dados.observacao),
+                        usuario_id=dados.usuario_id,
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            "ORDEN_ATIVA_CANCELAR"
+                        ),
+                    )
+
+        _definir_situacao(
+            conn,
+            empresa,
+            pedido,
+            alvo["codigo"],
+            usuario_id=dados.usuario_id,
+            observacao=dados.observacao,
+        )
         return _pedido(conn, empresa, pedido)
 
 
@@ -881,6 +1571,14 @@ def criar_separacao(dados: NovaSeparacao, usuario: _dependente) -> dict[str, Any
             descricao="Pedido marcado para separação",
             usuario_id=dados.usuario_id,
         )
+        _definir_situacao(
+            conn,
+            empresa,
+            pedido,
+            STATUS_LIBERADO,
+            usuario_id=dados.usuario_id,
+            observacao=dados.observacao,
+        )
         return _separacao_por_id(conn, nova)
 
 
@@ -964,6 +1662,14 @@ def iniciar_separacao(
                 descricao=_texto(dados.observacao),
                 usuario_id=dados.usuario_id,
             )
+        _definir_situacao(
+            conn,
+            atual["empresa"],
+            atual["pedido"],
+            STATUS_EM_SEPARACAO,
+            usuario_id=dados.usuario_id,
+            observacao=dados.observacao,
+        )
         return _separacao_por_id(conn, separacao_id)
 
 
@@ -978,6 +1684,14 @@ def concluir_separacao(
         if atual["status"] == STATUS_CANCELADO:
             raise HTTPException(status_code=409, detail="Ordem de separação cancelada")
         if atual["status"] == STATUS_SEPARADO:
+            _definir_situacao(
+                conn,
+                atual["empresa"],
+                atual["pedido"],
+                STATUS_SEPARADO,
+                usuario_id=dados.usuario_id,
+                observacao=dados.observacao,
+            )
             return _separacao_por_id(conn, separacao_id)
 
         pecas = conn.execute(
@@ -1025,6 +1739,14 @@ def concluir_separacao(
             usuario_id=dados.usuario_id,
             payload={"pecas": pecas},
         )
+        _definir_situacao(
+            conn,
+            atual["empresa"],
+            atual["pedido"],
+            STATUS_SEPARADO,
+            usuario_id=dados.usuario_id,
+            observacao=dados.observacao,
+        )
         return _separacao_por_id(conn, separacao_id)
 
 
@@ -1037,6 +1759,14 @@ def cancelar_separacao(
     with warehouse.engine().begin() as conn:
         atual = _travar_separacao(conn, separacao_id)
         if atual["status"] == STATUS_CANCELADO:
+            _definir_situacao(
+                conn,
+                atual["empresa"],
+                atual["pedido"],
+                STATUS_CANCELADO,
+                usuario_id=dados.usuario_id,
+                observacao=dados.motivo,
+            )
             return _separacao_por_id(conn, separacao_id)
 
         pecas = conn.execute(
@@ -1071,6 +1801,14 @@ def cancelar_separacao(
             descricao=_texto(dados.motivo) or _texto(dados.observacao),
             usuario_id=dados.usuario_id,
             payload={"pecasLiberadas": len(pecas)},
+        )
+        _definir_situacao(
+            conn,
+            atual["empresa"],
+            atual["pedido"],
+            STATUS_CANCELADO,
+            usuario_id=dados.usuario_id,
+            observacao=_texto(dados.motivo) or _texto(dados.observacao),
         )
         return _separacao_por_id(conn, separacao_id)
 
@@ -1234,10 +1972,13 @@ def pecas_do_item(
     separacao_id: int,
     item: int,
     usuario: _dependente,
-    busca: str = Query("", description="Rolo ou peca"),
+    busca: str = Query("", description="Rolo, peca ou texto no campo escolhido"),
     gaveta: str = Query("", description="Codigo da gaveta (endereco)"),
     sub_lote: str = Query("", alias="subLote", description="Sublote"),
     aviso: str = Query("", description="Aviso"),
+    campo: str = Query(
+        "", description="Campo da busca: lote (sub-lote), aviso ou gaveta"
+    ),
     limite: int = Query(50, ge=1, le=LIMITE_MAX),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -1251,14 +1992,24 @@ def pecas_do_item(
             raise HTTPException(status_code=404, detail="Ordem de separação não encontrada")
         item_pedido = _item_do_pedido(conn, cabecalho["empresa"], cabecalho["pedido"], item)
 
+        termo = busca.strip()
+        campo_busca = campo.strip().lower()
+        coluna_busca = CAMPOS_BUSCA_PECA.get(campo_busca) if campo_busca else None
+        if campo_busca and coluna_busca is None:
+            raise HTTPException(
+                status_code=400, detail="Campo de busca inválido: use lote, aviso ou gaveta"
+            )
         filtros, params = _condicoes_estoque(
-            busca=busca.strip(),
+            busca="" if coluna_busca else termo,
             gaveta=gaveta.strip(),
             sub_lote=sub_lote.strip(),
             aviso=aviso.strip(),
             cor="",
             produto="",
         )
+        if coluna_busca and termo:
+            filtros += f" and a.{coluna_busca} ilike :busca_campo"
+            params["busca_campo"] = f"%{termo}%"
         for coluna in ("produto", "situacao", "cor", "desenho", "variante", "categoria"):
             valor = item_pedido[coluna]
             if valor is None:
@@ -1438,6 +2189,13 @@ def adicionar_pecas(
             "PECAS_ADICIONADAS",
             usuario_id=dados.usuario_id,
             payload={"item": dados.item, "pecas": adicionadas},
+        )
+        _definir_situacao(
+            conn,
+            atual["empresa"],
+            atual["pedido"],
+            STATUS_EM_SEPARACAO,
+            usuario_id=dados.usuario_id,
         )
         return {
             "separacao": _separacao_por_id(conn, separacao_id),
