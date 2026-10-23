@@ -1,14 +1,13 @@
-"""WMS na api-microdata: enderecos, alocacao e movimentos no Postgres local.
+"""WMS na api-microdata: pedidos liberados, ordens de separacao e estoque em aberto.
 
-A suite roda contra o `dgbcomex_warehouse` real (como as demais), mas so com dados de teste
-identificados por um sufixo aleatorio: no teardown as linhas criadas sao apagadas. O estoque
-em aberto vem do `raw` (ERP), que nao e tocado.
+A suite roda contra o `dgbcomex_warehouse` real (como as demais) e contra o `raw` (ERP,
+somente leitura). Para nao sujar dados, cada teste escolhe um pedido liberado sem ordem
+ativa e apaga no teardown as ordens que criou (cascade em pecas/eventos).
 """
 
 from __future__ import annotations
 
 from typing import Any
-from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,187 +22,116 @@ from src.db import warehouse
 
 client = TestClient(app)
 
+SQL_ABERTA = """
+    not exists (
+        select 1
+        from raw.cte_baixa b
+        where b.empresa = a.empresa
+          and b.nro_rolo = a.nro_rolo
+          and b.nro_peca = a.nro_peca
+    )
+    and a.nro_rolo_origem is null
+"""
+
+
+def _cenario() -> dict[str, Any] | None:
+    """Pedido liberado (status 2) com saldo e uma peca em aberto compativel com um item."""
+    sql = f"""
+        select
+            i.empresa,
+            i.pedido,
+            i.item,
+            i.produto,
+            a.nro_rolo,
+            a.nro_peca
+        from raw.car_itens_pedido i
+        join raw.car_pedido p
+          on p.empresa = i.empresa and p.pedido = i.pedido
+        join lateral (
+            select a.empresa, a.nro_rolo, a.nro_peca
+            from raw.cte_peca a
+            where {SQL_ABERTA}
+              and a.empresa = i.empresa
+              and a.produto is not distinct from i.produto
+              and a.situacao is not distinct from i.situacao
+              and a.cor is not distinct from i.cor
+              and a.desenho is not distinct from i.desenho
+              and a.variante is not distinct from i.variante
+              and a.categoria is not distinct from i.categoria
+              and not exists (
+                  select 1
+                  from public.wms_separacao_pecas sp
+                  where sp.empresa = a.empresa
+                    and sp.nro_rolo = a.nro_rolo
+                    and sp.nro_peca = a.nro_peca
+                    and sp.status in ('RESERVADA', 'SEPARADA')
+              )
+            order by a.gaveta nulls last, a.nro_rolo, a.nro_peca
+            limit 1
+        ) a on true
+        where p.status = '2'
+          and coalesce(p.status_ped, '') <> 'E'
+          and coalesce(i.status_item, '') <> 'E'
+          and (i.qtde - coalesce(i.qtde_romaneio, 0) - coalesce(i.qtde_acerto, 0)) > 0
+          and not exists (
+              select 1
+              from public.wms_separacoes s
+              where s.empresa = i.empresa
+                and s.pedido = i.pedido
+                and s.status in ('LIBERADO', 'EM_SEPARACAO')
+          )
+        order by i.empresa, i.pedido, i.item
+        limit 1
+    """
+    with warehouse.engine().connect() as conn:
+        linha = conn.execute(text(sql)).mappings().first()
+    return dict(linha) if linha else None
+
 
 @pytest.fixture
-def sufixo() -> str:
-    return uuid4().hex[:10].upper()
+def cenario() -> Any:
+    dados = _cenario()
+    if dados is None:
+        pytest.skip("Sem pedido liberado com peca compativel no ambiente local")
+    dados["criadas"] = []
+    yield dados
+    if dados["criadas"]:
+        with warehouse.engine().begin() as conn:
+            for separacao_id in dados["criadas"]:
+                conn.execute(
+                    text("delete from public.wms_separacoes where id = :id"),
+                    {"id": separacao_id},
+                )
 
 
-@pytest.fixture
-def limpar(sufixo: str):
-    """Remove tudo que o teste criou (movimentos, estoque e enderecos)."""
-    marcador = f"TESTE-WMS-{sufixo}"
-    yield marcador
-    with warehouse.engine().begin() as conn:
-        conn.execute(
-            text("delete from public.wms_movimentos where nro_rolo like :padrao"),
-            {"padrao": f"{marcador}%"},
-        )
-        conn.execute(
-            text("delete from public.wms_estoque where nro_rolo like :padrao"),
-            {"padrao": f"{marcador}%"},
-        )
-        conn.execute(
-            text("delete from public.wms_enderecos where codigo like :padrao"),
-            {"padrao": f"{marcador}%"},
-        )
+def _criar(dados: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    corpo = {
+        "empresa": dados["empresa"],
+        "pedido": dados["pedido"],
+        "usuarioId": 7,
+        **extra,
+    }
+    resposta = client.post("/wms/separacoes", json=corpo)
+    assert resposta.status_code == 201, resposta.text
+    ordem = resposta.json()
+    dados["criadas"].append(ordem["id"])
+    return ordem
 
 
-def _endereco(codigo: str, tipo: str = "PULMAO", **extra: Any) -> dict[str, Any]:
-    return {"codigo": codigo, "tipo": tipo, **extra}
-
-
-def _entrada(marcador: str, endereco_id: int, **extra: Any) -> dict[str, Any]:
+def _peca(dados: dict[str, Any], **extra: Any) -> dict[str, Any]:
     return {
-        "tipo": "ENTRADA",
-        "enderecoDestinoId": endereco_id,
-        "usuarioId": 42,
-        "peca": {
-            "empresa": "13",
-            "nroRolo": marcador,
-            "nroPeca": "1",
-            "produto": "TECIDO",
-            "cor": "PRETO",
-            "largura": "1,40",
-            "metros": 12.5,
-            "peso": 3.2,
-            "loteInterno": marcador,
-            "dataEntrada": "2026-01-02",
-        },
+        "empresa": dados["empresa"],
+        "nroRolo": dados["nro_rolo"],
+        "nroPeca": dados["nro_peca"],
         **extra,
     }
 
 
-class TestEnderecos:
-    def test_lista(self):
-        resposta = client.get("/wms/enderecos")
-        assert resposta.status_code == 200
-        assert isinstance(resposta.json(), list)
-
-    def test_codigo_obrigatorio(self):
-        resposta = client.post("/wms/enderecos", json={"codigo": "   "})
-        assert resposta.status_code == 400
-        assert "obrigat" in resposta.json()["detail"]
-
-    def test_tipo_invalido_cai_em_pulmao(self, limpar):
-        resposta = client.post(
-            "/wms/enderecos", json=_endereco(limpar, tipo="INVALIDO")
-        )
-        assert resposta.status_code == 201
-        assert resposta.json()["tipo"] == "PULMAO"
-        assert resposta.json()["capacidade"] is None
-
-    def test_capacidade_numerica_sai_como_texto(self, limpar):
-        resposta = client.post(
-            "/wms/enderecos", json=_endereco(limpar, capacidade=1500.5)
-        )
-        assert resposta.status_code == 201
-        assert resposta.json()["capacidade"] == "1500.50"
-
-    def test_codigo_duplicado_da_409(self, limpar):
-        assert client.post("/wms/enderecos", json=_endereco(limpar)).status_code == 201
-        resposta = client.post("/wms/enderecos", json=_endereco(limpar))
-        assert resposta.status_code == 409
-        assert "código" in resposta.json()["detail"]
-
-
-class TestFluxoDeMovimentos:
-    def test_entrada_transferencia_ajuste_saida(self, limpar):
-        marcador = limpar
-        origem = client.post("/wms/enderecos", json=_endereco(f"{marcador}-A")).json()
-        destino = client.post("/wms/enderecos", json=_endereco(f"{marcador}-B")).json()
-
-        entrada = client.post("/wms/movimentos", json=_entrada(marcador, origem["id"]))
-        assert entrada.status_code == 201, entrada.text
-        corpo = entrada.json()
-        assert corpo["movimento"]["tipo"] == "ENTRADA"
-        assert corpo["movimento"]["destino"] == origem["codigo"]
-        assert corpo["peca"]["enderecoId"] == origem["id"]
-        assert corpo["peca"]["largura"] == "1,40"
-        estoque_id = corpo["peca"]["id"]
-
-        alocadas = client.get("/wms/estoque/alocado").json()
-        assert any(item["id"] == estoque_id for item in alocadas)
-
-        # A peca alocada deixa de aparecer como disponivel.
-        abertas = client.get(f"/wms/estoque?busca={marcador}").json()
-        assert abertas == {"itens": [], "total": 0}
-
-        transferencia = client.post(
-            "/wms/movimentos",
-            json={
-                "tipo": "TRANSFERENCIA",
-                "estoqueId": estoque_id,
-                "enderecoDestinoId": destino["id"],
-                "usuarioId": 42,
-            },
-        )
-        assert transferencia.status_code == 201, transferencia.text
-        movimento = transferencia.json()["movimento"]
-        assert movimento["origem"] == origem["codigo"]
-        assert movimento["destino"] == destino["codigo"]
-
-        alocadas = client.get("/wms/estoque/alocado").json()
-        assert next(i for i in alocadas if i["id"] == estoque_id)["enderecoId"] == destino["id"]
-
-        ajuste = client.post(
-            "/wms/movimentos",
-            json={"tipo": "AJUSTE", "estoqueId": estoque_id, "observacao": "conferido"},
-        )
-        assert ajuste.status_code == 201, ajuste.text
-
-        saida = client.post(
-            "/wms/movimentos",
-            json={"tipo": "SAIDA", "estoqueId": estoque_id, "usuarioId": 42},
-        )
-        assert saida.status_code == 201, saida.text
-        assert saida.json()["movimento"]["nroRolo"] == marcador
-
-        alocadas = client.get("/wms/estoque/alocado").json()
-        assert all(item["id"] != estoque_id for item in alocadas)
-
-        historico = client.get("/wms/movimentos?limite=20").json()
-        do_teste = [m for m in historico if m["nroRolo"] == marcador]
-        assert [m["tipo"] for m in do_teste] == ["SAIDA", "AJUSTE", "TRANSFERENCIA", "ENTRADA"]
-        assert all(m["usuarioId"] in (42, None) for m in do_teste)
-
-    def test_entrada_duplicada_da_409(self, limpar):
-        endereco = client.post("/wms/enderecos", json=_endereco(limpar)).json()
-        primeira = client.post("/wms/movimentos", json=_entrada(limpar, endereco["id"]))
-        assert primeira.status_code == 201
-        repetida = client.post("/wms/movimentos", json=_entrada(limpar, endereco["id"]))
-        assert repetida.status_code == 409
-        assert "já está alocada" in repetida.json()["detail"]
-
-    def test_entrada_sem_peca_da_400(self):
-        resposta = client.post("/wms/movimentos", json={"tipo": "ENTRADA"})
-        assert resposta.status_code == 400
-        assert "obrigat" in resposta.json()["detail"]
-
-    def test_entrada_com_endereco_inexistente_da_400(self, limpar):
-        resposta = client.post("/wms/movimentos", json=_entrada(limpar, 999_999))
-        assert resposta.status_code == 400
-        assert "Endereço" in resposta.json()["detail"]
-
-    def test_transferencia_com_endereco_inexistente_da_400(self, limpar):
-        endereco = client.post("/wms/enderecos", json=_endereco(limpar)).json()
-        estoque_id = client.post(
-            "/wms/movimentos", json=_entrada(limpar, endereco["id"])
-        ).json()["peca"]["id"]
-
-        resposta = client.post(
-            "/wms/movimentos",
-            json={"tipo": "TRANSFERENCIA", "estoqueId": estoque_id, "enderecoDestinoId": 999_999},
-        )
-        assert resposta.status_code == 400
-
-    def test_peca_inexistente_da_404(self):
-        resposta = client.post("/wms/movimentos", json={"tipo": "SAIDA", "estoqueId": 999_999})
-        assert resposta.status_code == 404
-
-    def test_tipo_invalido_da_400(self):
-        resposta = client.post("/wms/movimentos", json={"tipo": "X", "estoqueId": 1})
-        assert resposta.status_code == 400
+def _adicionar(ordem: dict[str, Any], dados: dict[str, Any]) -> Any:
+    return client.post(
+        f"/wms/separacoes/{ordem['id']}/pecas",
+        json={"item": dados["item"], "pecas": [_peca(dados)], "usuarioId": 7},
+    )
 
 
 class TestDashboard:
@@ -212,15 +140,306 @@ class TestDashboard:
         assert resposta.status_code == 200
         corpo = resposta.json()
         assert set(corpo) == {
-            "enderecos",
-            "enderecosAtivos",
-            "pecasAlocadas",
-            "metrosAlocados",
+            "pedidosLiberados",
+            "separacoesLiberadas",
+            "separacoesEmAndamento",
+            "separacoesConcluidas",
+            "pecasReservadas",
+            "metrosReservados",
             "pecasEmAberto",
-            "movimentosHoje",
+            "gavetas",
         }
+        assert corpo["pedidosLiberados"] > 0
         assert corpo["pecasEmAberto"] > 0
-        assert isinstance(corpo["metrosAlocados"], float)
+        assert isinstance(corpo["metrosReservados"], float)
+
+
+class TestGavetas:
+    def test_lista_catalogo_do_erp(self):
+        resposta = client.get("/wms/gavetas?limite=5")
+        assert resposta.status_code == 200
+        corpo = resposta.json()
+        assert corpo["total"] > 0
+        assert len(corpo["itens"]) <= 5
+        gaveta = corpo["itens"][0]
+        assert set(gaveta) == {
+            "codigo",
+            "descricao",
+            "grupoGaveta",
+            "zona",
+            "setor",
+            "fazSugestao",
+            "estoquePlano",
+            "confirmarTransferencia",
+            "pecas",
+            "metros",
+        }
+
+    def test_busca_por_codigo(self):
+        codigo = client.get("/wms/gavetas?limite=1").json()["itens"][0]["codigo"]
+        corpo = client.get(f"/wms/gavetas?busca={codigo}").json()
+        assert any(item["codigo"] == codigo for item in corpo["itens"])
+
+
+class TestPedidos:
+    def test_lista_backlog(self):
+        resposta = client.get("/wms/pedidos?limite=5")
+        assert resposta.status_code == 200
+        corpo = resposta.json()
+        assert corpo["total"] > 0
+        pedido = corpo["itens"][0]
+        assert pedido["status"] == "2"
+        assert pedido["separacaoStatus"] in (
+            "SEM_SEPARACAO",
+            "LIBERADO",
+            "EM_SEPARACAO",
+            "SEPARADO",
+        )
+
+    def test_filtro_sem_separacao(self):
+        corpo = client.get("/wms/pedidos?statusSeparacao=SEM_SEPARACAO&limite=5").json()
+        assert all(item["separacaoStatus"] == "SEM_SEPARACAO" for item in corpo["itens"])
+
+    def test_detalhe_com_itens(self, cenario):
+        resposta = client.get(
+            f"/wms/pedidos/{cenario['empresa']}/{cenario['pedido']}"
+        )
+        assert resposta.status_code == 200
+        corpo = resposta.json()
+        assert corpo["pedido"] == cenario["pedido"]
+        assert corpo["separacaoStatus"] == "SEM_SEPARACAO"
+        assert any(item["item"] == cenario["item"] for item in corpo["itens"])
+
+    def test_pedido_inexistente_da_404(self):
+        resposta = client.get("/wms/pedidos/13/INEXISTENTE")
+        assert resposta.status_code == 404
+
+
+class TestFluxoSeparacao:
+    def test_criar_listar_detalhar(self, cenario):
+        ordem = _criar(cenario)
+        assert ordem["status"] == "LIBERADO"
+        assert ordem["pedido"] == cenario["pedido"]
+        assert ordem["totalPecas"] == 0
+
+        lista = client.get(f"/wms/separacoes?busca={cenario['pedido']}").json()
+        assert any(item["id"] == ordem["id"] for item in lista["itens"])
+
+        detalhe = client.get(f"/wms/separacoes/{ordem['id']}").json()
+        assert detalhe["id"] == ordem["id"]
+        assert detalhe["pecas"] == []
+        assert detalhe["itens"]
+
+    def test_pedido_com_ordem_ativa_da_409(self, cenario):
+        _criar(cenario)
+        resposta = client.post(
+            "/wms/separacoes",
+            json={"empresa": cenario["empresa"], "pedido": cenario["pedido"]},
+        )
+        assert resposta.status_code == 409
+        assert "ativa" in resposta.json()["detail"]
+
+    def test_pedido_inexistente_da_400(self):
+        resposta = client.post(
+            "/wms/separacoes", json={"empresa": "13", "pedido": "INEXISTENTE"}
+        )
+        assert resposta.status_code == 400
+        assert "liberado" in resposta.json()["detail"]
+
+    def test_adicionar_peca_reserva_e_some_do_estoque(self, cenario):
+        ordem = _criar(cenario)
+        resposta = _adicionar(ordem, cenario)
+        assert resposta.status_code == 201, resposta.text
+        corpo = resposta.json()
+        assert corpo["adicionadas"] == 1
+        assert corpo["separacao"]["status"] == "EM_SEPARACAO"
+        assert corpo["separacao"]["totalPecas"] == 1
+
+        detalhe = client.get(f"/wms/separacoes/{ordem['id']}").json()
+        peca = detalhe["pecas"][0]
+        assert peca["nroRolo"] == cenario["nro_rolo"]
+        assert peca["nroPeca"] == cenario["nro_peca"]
+        assert peca["status"] == "RESERVADA"
+        assert peca["baixadoNoErp"] is False
+
+        busca = (
+            f"/wms/estoque?busca={cenario['nro_rolo']}"
+            f"&subLote=&limite=500"
+        )
+        estoque = client.get(busca).json()
+        assert all(
+            not (
+                item["nro_rolo"] == cenario["nro_rolo"]
+                and item["nro_peca"] == cenario["nro_peca"]
+            )
+            for item in estoque["itens"]
+        )
+
+        disponiveis = client.get(
+            f"/wms/separacoes/{ordem['id']}/itens/{cenario['item']}/pecas?limite=500"
+        ).json()
+        assert all(
+            not (
+                item["nro_rolo"] == cenario["nro_rolo"]
+                and item["nro_peca"] == cenario["nro_peca"]
+            )
+            for item in disponiveis["itens"]
+        )
+
+    def test_peca_duplicada_da_409(self, cenario):
+        ordem = _criar(cenario)
+        assert _adicionar(ordem, cenario).status_code == 201
+        repetida = _adicionar(ordem, cenario)
+        assert repetida.status_code == 409
+        assert "reservada" in repetida.json()["detail"]
+
+    def test_peca_incompativel_da_400(self, cenario):
+        outra = _peca_incompativel(cenario)
+        if outra is None:
+            pytest.skip("Sem peca em aberto incompativel no ambiente local")
+        ordem = _criar(cenario)
+        resposta = client.post(
+            f"/wms/separacoes/{ordem['id']}/pecas",
+            json={"item": cenario["item"], "pecas": [outra], "usuarioId": 7},
+        )
+        assert resposta.status_code == 400
+        assert "indisponível" in resposta.json()["detail"]
+
+    def test_concluir_mantem_pecas_bloqueadas(self, cenario):
+        ordem = _criar(cenario)
+        assert _adicionar(ordem, cenario).status_code == 201
+        peca_id = client.get(f"/wms/separacoes/{ordem['id']}").json()["pecas"][0]["id"]
+
+        concluida = client.post(
+            f"/wms/separacoes/{ordem['id']}/concluir", json={"usuarioId": 7}
+        )
+        assert concluida.status_code == 200, concluida.text
+        corpo = concluida.json()
+        assert corpo["status"] == "SEPARADO"
+        assert corpo["concluidoPor"] == 7
+
+        detalhe = client.get(f"/wms/separacoes/{ordem['id']}").json()
+        assert detalhe["pecas"][0]["status"] == "SEPARADA"
+
+        remover = client.delete(
+            f"/wms/separacoes/{ordem['id']}/pecas/{peca_id}?usuarioId=7"
+        )
+        assert remover.status_code == 409
+
+        # Concluir de novo e idempotente.
+        assert (
+            client.post(f"/wms/separacoes/{ordem['id']}/concluir", json={}).status_code
+            == 200
+        )
+
+    def test_concluir_sem_pecas_da_400(self, cenario):
+        ordem = _criar(cenario)
+        resposta = client.post(f"/wms/separacoes/{ordem['id']}/concluir", json={})
+        assert resposta.status_code == 400
+        assert "peça" in resposta.json()["detail"]
+
+    def test_iniciar_e_idempotente(self, cenario):
+        ordem = _criar(cenario)
+        primeira = client.post(f"/wms/separacoes/{ordem['id']}/iniciar", json={"usuarioId": 3})
+        assert primeira.status_code == 200
+        assert primeira.json()["status"] == "EM_SEPARACAO"
+        assert primeira.json()["iniciadoPor"] == 3
+        segunda = client.post(f"/wms/separacoes/{ordem['id']}/iniciar", json={})
+        assert segunda.status_code == 200
+        assert segunda.json()["status"] == "EM_SEPARACAO"
+
+    def test_cancelar_libera_pecas(self, cenario):
+        ordem = _criar(cenario)
+        assert _adicionar(ordem, cenario).status_code == 201
+
+        cancelada = client.post(
+            f"/wms/separacoes/{ordem['id']}/cancelar",
+            json={"motivo": "cliente desistiu", "usuarioId": 9},
+        )
+        assert cancelada.status_code == 200, cancelada.text
+        corpo = cancelada.json()
+        assert corpo["status"] == "CANCELADO"
+        assert corpo["motivoCancelamento"] == "cliente desistiu"
+        assert corpo["canceladoPor"] == 9
+        assert corpo["totalPecas"] == 0
+
+        disponiveis = client.get(
+            f"/wms/separacoes/{ordem['id']}/itens/{cenario['item']}/pecas?limite=500"
+        )
+        # Ordem cancelada ainda pode listar pecas disponiveis para o item.
+        assert disponiveis.status_code == 200
+        assert any(
+            item["nro_rolo"] == cenario["nro_rolo"]
+            and item["nro_peca"] == cenario["nro_peca"]
+            for item in disponiveis.json()["itens"]
+        )
+
+    def test_remover_peca_em_separacao(self, cenario):
+        ordem = _criar(cenario)
+        assert _adicionar(ordem, cenario).status_code == 201
+        peca_id = client.get(f"/wms/separacoes/{ordem['id']}").json()["pecas"][0]["id"]
+
+        removida = client.delete(
+            f"/wms/separacoes/{ordem['id']}/pecas/{peca_id}?usuarioId=7"
+        )
+        assert removida.status_code == 200, removida.text
+        assert removida.json()["separacao"]["totalPecas"] == 0
+
+        # Depois de liberada, pode ser reservada de novo.
+        assert _adicionar(ordem, cenario).status_code == 201
+
+    def test_ordem_inexistente_da_404(self):
+        assert client.get("/wms/separacoes/999999").status_code == 404
+        assert (
+            client.post("/wms/separacoes/999999/iniciar", json={}).status_code == 404
+        )
+
+
+def _peca_incompativel(dados: dict[str, Any]) -> dict[str, Any] | None:
+    sql = f"""
+        select a.empresa, a.nro_rolo, a.nro_peca
+        from raw.cte_peca a
+        where {SQL_ABERTA}
+          and a.produto is distinct from :produto
+          and not exists (
+              select 1
+              from public.wms_separacao_pecas sp
+              where sp.empresa = a.empresa
+                and sp.nro_rolo = a.nro_rolo
+                and sp.nro_peca = a.nro_peca
+                and sp.status in ('RESERVADA', 'SEPARADA')
+          )
+        order by a.nro_rolo
+        limit 1
+    """
+    with warehouse.engine().connect() as conn:
+        linha = conn.execute(
+            text(sql), {"produto": dados["produto"]}
+        ).mappings().first()
+    return (
+        {
+            "empresa": linha["empresa"],
+            "nroRolo": linha["nro_rolo"],
+            "nroPeca": linha["nro_peca"],
+        }
+        if linha
+        else None
+    )
+
+
+class TestEstoque:
+    def test_lista_em_aberto(self):
+        corpo = client.get("/wms/estoque?limite=5").json()
+        assert corpo["total"] > 0
+        assert len(corpo["itens"]) <= 5
+        item = corpo["itens"][0]
+        assert item["nro_rolo"]
+        assert isinstance(item["metros"], (int, float)) or item["metros"] is None
+
+    def test_filtro_gaveta(self):
+        gaveta = client.get("/wms/gavetas?limite=1").json()["itens"][0]["codigo"]
+        corpo = client.get(f"/wms/estoque?gaveta={gaveta}&limite=500").json()
+        assert all(item["gaveta"] == gaveta for item in corpo["itens"])
 
 
 class TestEscopo:
@@ -251,12 +470,11 @@ class TestEscopo:
         "metodo,rota,corpo",
         [
             ("GET", "/wms/dashboard", None),
-            ("GET", "/wms/enderecos", None),
+            ("GET", "/wms/gavetas", None),
+            ("GET", "/wms/pedidos", None),
             ("GET", "/wms/estoque", None),
-            ("GET", "/wms/estoque/alocado", None),
-            ("GET", "/wms/movimentos", None),
-            ("POST", "/wms/enderecos", {"codigo": "X"}),
-            ("POST", "/wms/movimentos", {"tipo": "AJUSTE", "estoqueId": 1}),
+            ("GET", "/wms/separacoes", None),
+            ("POST", "/wms/separacoes", {"empresa": "13", "pedido": "X"}),
         ],
     )
     def test_sem_estoque_leitura_da_403(self, ligado, monkeypatch, metodo, rota, corpo):

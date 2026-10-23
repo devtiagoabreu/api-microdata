@@ -514,6 +514,22 @@ FONTES: tuple[Fonte, ...] = (
     ),
     Fonte(
         dominio="estoque",
+        tabela_erp="Cte_GrupoGaveta",
+        chave_natural=("Codigo",),
+        estrategia="full",
+        linhas_erp=9,
+        doc="Est. 24 (zonas do armazem; cadastro criado no ERP e lido pelo WMS)",
+    ),
+    Fonte(
+        dominio="estoque",
+        tabela_erp="Cte_Gaveta",
+        chave_natural=("Codigo",),
+        estrategia="full",
+        linhas_erp=741,
+        doc="Est. 24 (gaveta = endereco fisico da peca; FK GrupoGaveta = zona)",
+    ),
+    Fonte(
+        dominio="estoque",
         tabela_erp="Car_Pedido",
         chave_natural=("Empresa", "Pedido"),
         estrategia="full",
