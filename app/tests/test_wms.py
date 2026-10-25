@@ -94,14 +94,58 @@ def cenario() -> Any:
     if dados is None:
         pytest.skip("Sem pedido liberado com peca compativel no ambiente local")
     dados["criadas"] = []
+    chave = {"empresa": dados["empresa"], "pedido": dados["pedido"]}
+    with warehouse.engine().connect() as conn:
+        dados["situacao_original"] = conn.execute(
+            text(
+                "select situacao_id from public.wms_pedidos_situacao "
+                "where empresa = :empresa and pedido = :pedido"
+            ),
+            chave,
+        ).scalar_one_or_none()
+        dados["ultimo_evento"] = conn.execute(
+            text(
+                "select coalesce(max(id), 0) from public.wms_pedido_eventos "
+                "where empresa = :empresa and pedido = :pedido"
+            ),
+            chave,
+        ).scalar_one()
     yield dados
-    if dados["criadas"]:
-        with warehouse.engine().begin() as conn:
-            for separacao_id in dados["criadas"]:
-                conn.execute(
-                    text("delete from public.wms_separacoes where id = :id"),
-                    {"id": separacao_id},
-                )
+    with warehouse.engine().begin() as conn:
+        for separacao_id in dados["criadas"]:
+            conn.execute(
+                text("delete from public.wms_separacoes where id = :id"),
+                {"id": separacao_id},
+            )
+        conn.execute(
+            text(
+                "delete from public.wms_pedido_eventos "
+                "where empresa = :empresa and pedido = :pedido and id > :ultimo"
+            ),
+            {**chave, "ultimo": dados["ultimo_evento"]},
+        )
+        if dados["situacao_original"] is None:
+            conn.execute(
+                text(
+                    "delete from public.wms_pedidos_situacao "
+                    "where empresa = :empresa and pedido = :pedido"
+                ),
+                chave,
+            )
+        else:
+            conn.execute(
+                text(
+                    """
+                    insert into public.wms_pedidos_situacao
+                        (empresa, pedido, situacao_id, atualizado_em)
+                    values (:empresa, :pedido, :situacao_id, now())
+                    on conflict (empresa, pedido) do update
+                        set situacao_id = excluded.situacao_id,
+                            atualizado_em = now()
+                    """
+                ),
+                {**chave, "situacao_id": dados["situacao_original"]},
+            )
 
 
 def _criar(dados: dict[str, Any], **extra: Any) -> dict[str, Any]:
@@ -131,6 +175,21 @@ def _adicionar(ordem: dict[str, Any], dados: dict[str, Any]) -> Any:
     return client.post(
         f"/wms/separacoes/{ordem['id']}/pecas",
         json={"item": dados["item"], "pecas": [_peca(dados)], "usuarioId": 7},
+    )
+
+
+def _situacao_id(codigo: str) -> int:
+    with warehouse.engine().connect() as conn:
+        return conn.execute(
+            text("select id from public.wms_situacoes_pedido where codigo = :codigo"),
+            {"codigo": codigo},
+        ).scalar_one()
+
+
+def _mover(dados: dict[str, Any], codigo: str, **extra: Any) -> Any:
+    return client.post(
+        f"/wms/pedidos/{dados['empresa']}/{dados['pedido']}/situacao",
+        json={"situacaoId": _situacao_id(codigo), "usuarioId": 7, **extra},
     )
 
 
@@ -212,6 +271,110 @@ class TestPedidos:
 
     def test_pedido_inexistente_da_404(self):
         resposta = client.get("/wms/pedidos/13/INEXISTENTE")
+        assert resposta.status_code == 404
+
+
+class TestSituacoes:
+    def test_lista_padroes(self):
+        resposta = client.get("/wms/situacoes")
+        assert resposta.status_code == 200
+        corpo = resposta.json()
+        codigos = {item["codigo"]: item for item in corpo["itens"]}
+        assert {"SEM_SEPARACAO", "LIBERADO", "EM_SEPARACAO", "SEPARADO", "CANCELADO"} <= set(
+            codigos
+        )
+        assert codigos["EM_SEPARACAO"]["acao"] == "CRIAR_ORDEM"
+        assert codigos["SEM_SEPARACAO"]["sistema"] is True
+
+    def test_crud_situacao_customizada(self):
+        criada = client.post(
+            "/wms/situacoes",
+            json={
+                "nome": "Aguardando conferência",
+                "cor": "#123abc",
+                "ordem": 15,
+                "acao": "NENHUMA",
+                "perfis": ["comercial", "EXPEDICAO"],
+            },
+        )
+        assert criada.status_code == 201, criada.text
+        situacao = criada.json()
+        try:
+            assert situacao["codigo"] == "AGUARDANDO_CONFERENCIA"
+            assert situacao["perfis"] == ["COMERCIAL", "EXPEDICAO"]
+
+            editada = client.put(
+                f"/wms/situacoes/{situacao['id']}",
+                json={"nome": "Em conferência", "cor": "#16a34a"},
+            )
+            assert editada.status_code == 200, editada.text
+            assert editada.json()["nome"] == "Em conferência"
+            assert editada.json()["cor"] == "#16a34a"
+        finally:
+            assert client.delete(f"/wms/situacoes/{situacao['id']}").status_code == 200
+
+    def test_situacao_padrao_nao_pode_ser_excluida(self):
+        resposta = client.delete(f"/wms/situacoes/{_situacao_id('SEM_SEPARACAO')}")
+        assert resposta.status_code == 409
+
+    def test_situacao_em_uso_nao_pode_ser_excluida(self, cenario):
+        assert _mover(cenario, "LIBERADO").status_code == 200
+        resposta = client.delete(f"/wms/situacoes/{_situacao_id('LIBERADO')}")
+        assert resposta.status_code == 409
+
+
+class TestKanbanPedidos:
+    def test_mover_para_liberado_nao_cria_ordem(self, cenario):
+        resposta = _mover(cenario, "LIBERADO")
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        assert corpo["separacaoStatus"] == "LIBERADO"
+        assert corpo["situacaoNome"] == "Liberado"
+        assert corpo["separacaoId"] is None
+
+    def test_mover_para_em_separacao_cria_ordem(self, cenario):
+        resposta = _mover(cenario, "EM_SEPARACAO")
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        assert corpo["separacaoStatus"] == "EM_SEPARACAO"
+        assert corpo["separacaoId"] is not None
+        cenario["criadas"].append(corpo["separacaoId"])
+        ordem = client.get(f"/wms/separacoes/{corpo['separacaoId']}").json()
+        assert ordem["status"] == "EM_SEPARACAO"
+
+    def test_mover_para_separado_sem_pecas_da_400(self, cenario):
+        criada = _mover(cenario, "EM_SEPARACAO")
+        cenario["criadas"].append(criada.json()["separacaoId"])
+        resposta = _mover(cenario, "SEPARADO")
+        assert resposta.status_code == 400
+
+    def test_mover_para_cancelado_libera_pecas(self, cenario):
+        criada = _mover(cenario, "EM_SEPARACAO")
+        ordem = client.get(f"/wms/separacoes/{criada.json()['separacaoId']}").json()
+        cenario["criadas"].append(ordem["id"])
+        assert _adicionar(ordem, cenario).status_code == 201
+
+        resposta = _mover(cenario, "CANCELADO", observacao="Teste de cancelamento")
+        assert resposta.status_code == 200, resposta.text
+        assert resposta.json()["separacaoStatus"] == "CANCELADO"
+        cancelada = client.get(f"/wms/separacoes/{ordem['id']}").json()
+        assert cancelada["status"] == "CANCELADO"
+        assert cancelada["totalPecas"] == 0
+
+    def test_voltar_para_liberado_com_pecas_da_409(self, cenario):
+        criada = _mover(cenario, "EM_SEPARACAO")
+        ordem = client.get(f"/wms/separacoes/{criada.json()['separacaoId']}").json()
+        cenario["criadas"].append(ordem["id"])
+        assert _adicionar(ordem, cenario).status_code == 201
+
+        resposta = _mover(cenario, "LIBERADO")
+        assert resposta.status_code == 409
+
+    def test_situacao_inexistente_da_404(self, cenario):
+        resposta = client.post(
+            f"/wms/pedidos/{cenario['empresa']}/{cenario['pedido']}/situacao",
+            json={"situacaoId": 999999},
+        )
         assert resposta.status_code == 404
 
 
@@ -393,6 +556,67 @@ class TestFluxoSeparacao:
         assert (
             client.post("/wms/separacoes/999999/iniciar", json={}).status_code == 404
         )
+
+
+class TestBuscaPecasPorCampo:
+    def _valores(self, cenario: dict[str, Any]) -> dict[str, str]:
+        with warehouse.engine().connect() as conn:
+            linha = conn.execute(
+                text(
+                    """
+                    select sub_lote, aviso, gaveta
+                    from raw.cte_peca
+                    where empresa = :empresa
+                      and nro_rolo = :nro_rolo
+                      and nro_peca = :nro_peca
+                    """
+                ),
+                {
+                    "empresa": cenario["empresa"],
+                    "nro_rolo": cenario["nro_rolo"],
+                    "nro_peca": cenario["nro_peca"],
+                },
+            ).mappings().one()
+        return {
+            "lote": linha["sub_lote"],
+            "aviso": linha["aviso"],
+            "gaveta": linha["gaveta"],
+        }
+
+    def test_busca_por_lote_aviso_e_gaveta(self, cenario):
+        ordem = _criar(cenario)
+        valores = self._valores(cenario)
+        chaves = {"lote": "sub_lote", "aviso": "aviso", "gaveta": "gaveta"}
+        testados = 0
+        for campo, valor in valores.items():
+            if not valor:
+                continue
+            testados += 1
+            resposta = client.get(
+                f"/wms/separacoes/{ordem['id']}/itens/{cenario['item']}/pecas",
+                params={"campo": campo, "busca": valor, "limite": 500},
+            )
+            assert resposta.status_code == 200, resposta.text
+            itens = resposta.json()["itens"]
+            assert any(
+                item["nro_rolo"] == cenario["nro_rolo"]
+                and item["nro_peca"] == cenario["nro_peca"]
+                for item in itens
+            )
+            chave = chaves[campo]
+            assert all(
+                valor.lower() in str(item[chave] or "").lower() for item in itens
+            )
+        if testados == 0:
+            pytest.skip("Peca do cenario sem lote, aviso ou gaveta para testar")
+
+    def test_campo_invalido_da_400(self, cenario):
+        ordem = _criar(cenario)
+        resposta = client.get(
+            f"/wms/separacoes/{ordem['id']}/itens/{cenario['item']}/pecas",
+            params={"campo": "inexistente", "busca": "x"},
+        )
+        assert resposta.status_code == 400
 
 
 def _peca_incompativel(dados: dict[str, Any]) -> dict[str, Any] | None:

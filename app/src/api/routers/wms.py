@@ -2240,3 +2240,61 @@ def remover_peca(
 
 
 __all__ = ["router"]
+
+
+class KanbanReordenarItem(BaseModel):
+    chave: str
+    posicao: int = Field(ge=0)
+
+
+class KanbanReordenar(BaseModel):
+    tipo: str = Field(pattern="^(PEDIDO|SEPARACAO)$")
+    coluna: str
+    itens: list[KanbanReordenarItem]
+    usuario_id: int | None = None
+
+@router.get("/wms/kanban/ordem")
+def kanban_ordem(
+    usuario: _dependente,
+    tipo: str = Query(..., pattern="^(PEDIDO|SEPARACAO)$"),
+    colunas: str = Query(""),
+):
+    where = ["tipo = :tipo"]
+    params: dict = {"tipo": tipo}
+    lista = [c.strip().upper() for c in colunas.split(",") if c.strip()]
+    if lista:
+        where.append("coluna = ANY(:colunas)")
+        params["colunas"] = lista
+    sql = text(f"select chave, coluna, posicao from public.wms_kanban_ordem where {' and '.join(where)}")
+    with engine.begin() as conn:
+        rows = conn.execute(sql, params).mappings().all()
+    res: dict[str, dict[str, int]] = {}
+    for r in rows:
+        res.setdefault(r["coluna"], {})[r["chave"]] = int(r["posicao"] or 0)
+    return res
+
+
+@router.post("/wms/kanban/reordenar")
+def kanban_reordenar(usuario: _dependente, dados: KanbanReordenar):
+    with engine.begin() as conn:
+        for item in dados.itens:
+            conn.execute(
+                text(
+                    """
+                    insert into public.wms_kanban_ordem (tipo, chave, empresa, pedido, separacao_id, coluna, posicao, atualizado_em, atualizado_por)
+                    values (:tipo, :chave, :empresa, :pedido, :separacao_id, :coluna, :posicao, now(), :atualizado_por)
+                    on conflict (tipo,chave,coluna) do update set posicao = excluded.posicao, atualizado_em = now(), atualizado_por = excluded.atualizado_por
+                    """
+                ),
+                {
+                    "tipo": dados.tipo,
+                    "chave": item.chave,
+                    "empresa": (item.chave.split("|")[0] if "|" in item.chave else None),
+                    "pedido": (item.chave.split("|")[1] if "|" in item.chave and dados.tipo == "PEDIDO" else None),
+                    "separacao_id": int(item.chave) if dados.tipo == "SEPARACAO" and item.chave.isdigit() else None,
+                    "coluna": dados.coluna,
+                    "posicao": int(item.posicao or 0),
+                    "atualizado_por": dados.usuario_id,
+                },
+            )
+    return {"ok": True}
