@@ -274,6 +274,47 @@ class TestPedidos:
         assert resposta.status_code == 404
 
 
+class TestKanbanOrdem:
+    def test_salvar_e_ler_ordem_dos_pedidos(self):
+        corpo = {
+            "tipo": "PEDIDO",
+            "coluna": "LIBERADO",
+            "itens": [
+                {"chave": "13|90000001", "posicao": 0},
+                {"chave": "13|90000002", "posicao": 1},
+            ],
+        }
+        resposta = client.post("/wms/kanban/reordenar", json=corpo)
+        assert resposta.status_code == 200, resposta.text
+        assert resposta.json() == {"ok": True}
+
+        ordem = client.get("/wms/kanban/ordem?tipo=PEDIDO&colunas=LIBERADO").json()
+        assert ordem["LIBERADO"]["13|90000001"] == 0
+        assert ordem["LIBERADO"]["13|90000002"] == 1
+
+    def test_reordenar_atualiza_a_posicao_existente(self):
+        corpo = {
+            "tipo": "SEPARACAO",
+            "coluna": "EM_SEPARACAO",
+            "itens": [{"chave": "90000001", "posicao": 0}],
+        }
+        assert client.post("/wms/kanban/reordenar", json=corpo).status_code == 200
+        corpo["itens"] = [{"chave": "90000001", "posicao": 3}]
+        assert client.post("/wms/kanban/reordenar", json=corpo).status_code == 200
+
+        ordem = client.get(
+            "/wms/kanban/ordem?tipo=SEPARACAO&colunas=EM_SEPARACAO"
+        ).json()
+        assert ordem["EM_SEPARACAO"]["90000001"] == 3
+
+    def test_tipo_invalido_da_422(self):
+        resposta = client.post(
+            "/wms/kanban/reordenar",
+            json={"tipo": "OUTRO", "coluna": "LIBERADO", "itens": []},
+        )
+        assert resposta.status_code == 422
+
+
 class TestSituacoes:
     def test_lista_padroes(self):
         resposta = client.get("/wms/situacoes")
@@ -369,6 +410,22 @@ class TestKanbanPedidos:
 
         resposta = _mover(cenario, "LIBERADO")
         assert resposta.status_code == 409
+        assert resposta.json()["detail"] == "ORDEN_ATIVA_CANCELAR"
+
+    def test_voltar_para_sem_separacao_cancelando_ordem(self, cenario):
+        criada = _mover(cenario, "EM_SEPARACAO")
+        ordem = client.get(f"/wms/separacoes/{criada.json()['separacaoId']}").json()
+        cenario["criadas"].append(ordem["id"])
+        assert _adicionar(ordem, cenario).status_code == 201
+
+        resposta = _mover(cenario, "SEM_SEPARACAO", cancelar_ordem=True)
+        assert resposta.status_code == 200, resposta.text
+        assert resposta.json()["separacaoStatus"] == "SEM_SEPARACAO"
+
+        cancelada = client.get(f"/wms/separacoes/{ordem['id']}").json()
+        assert cancelada["status"] == "CANCELADO"
+        assert cancelada["totalPecas"] == 0
+        assert cancelada["pecas"] == []
 
     def test_situacao_inexistente_da_404(self, cenario):
         resposta = client.post(

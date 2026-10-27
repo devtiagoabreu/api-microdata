@@ -197,6 +197,7 @@ def _painel(linha: Any) -> dict[str, Any]:
         "totalMetros": _float0(linha["total_metros"]),
         "itensSeparados": linha["itens_separados"],
         "saldoMetros": _float0(linha["saldo_metros"]),
+        "artigos": linha["artigos"],
     }
 
 
@@ -535,7 +536,15 @@ select
         where i.empresa = s.empresa
           and i.pedido = s.pedido
           and coalesce(i.status_item, '') <> 'E'
-    ) as saldo_metros
+    ) as saldo_metros,
+    (
+        select string_agg(distinct pr.descricao, ', ')
+        from raw.car_itens_pedido i
+        left join raw.produtos pr on pr.codigo = i.produto
+        where i.empresa = s.empresa
+          and i.pedido = s.pedido
+          and coalesce(i.status_item, '') <> 'E'
+    ) as artigos
 from public.wms_separacoes s
 {onde}
 {ordem}
@@ -631,10 +640,12 @@ select
     st.cor                                 as situacao_cor,
     st.ordem                               as situacao_ordem,
     st.acao                                as situacao_acao,
-    st.perfis                              as situacao_perfis
+    st.perfis                              as situacao_perfis,
+    string_agg(distinct pr.descricao, ', ') filter (where pr.descricao is not null) as artigos
 from raw.car_pedido p
 join raw.car_itens_pedido i
   on i.empresa = p.empresa and i.pedido = p.pedido
+left join raw.produtos pr on pr.codigo = i.produto
 left join raw.clientes_principal c on c.codigo_cliente = p.cliente
 left join public.wms_pedidos_situacao ps
   on ps.empresa = p.empresa and ps.pedido = p.pedido
@@ -851,6 +862,7 @@ def listar_pedidos(
                 "situacaoOrdem": linha["situacao_ordem"],
                 "situacaoAcao": linha["situacao_acao"],
                 "situacaoPerfis": list(linha["situacao_perfis"] or []),
+                "artigos": linha["artigos"],
             }
             for linha in conn.execute(
                 text(SQL_PEDIDOS.format(filtros=filtro)), params
@@ -1394,6 +1406,41 @@ def mover_pedido_situacao(
                         "LIBERADA",
                         descricao=_texto(dados.observacao),
                         usuario_id=dados.usuario_id,
+                    )
+                elif dados.cancelar_ordem:
+                    liberadas = conn.execute(
+                        text(
+                            "delete from public.wms_separacao_pecas "
+                            "where separacao_id = :id returning id"
+                        ),
+                        {"id": ordem["id"]},
+                    ).all()
+                    conn.execute(
+                        text(
+                            """
+                            update public.wms_separacoes
+                            set status = 'CANCELADO',
+                                motivo_cancelamento = :motivo,
+                                cancelado_por = :usuario_id,
+                                cancelado_em = now(),
+                                atualizado_em = now()
+                            where id = :id
+                            """
+                        ),
+                        {
+                            "id": ordem["id"],
+                            "motivo": _texto(dados.observacao),
+                            "usuario_id": dados.usuario_id,
+                        },
+                    )
+                    _evento(
+                        conn,
+                        ordem["id"],
+                        "CANCELADA",
+                        descricao=_texto(dados.observacao)
+                        or "Cancelada ao mover o pedido",
+                        usuario_id=dados.usuario_id,
+                        payload={"pecasLiberadas": len(liberadas)},
                     )
                 else:
                     raise HTTPException(
@@ -2239,9 +2286,6 @@ def remover_peca(
         }
 
 
-__all__ = ["router"]
-
-
 class KanbanReordenarItem(BaseModel):
     chave: str
     posicao: int = Field(ge=0)
@@ -2253,20 +2297,25 @@ class KanbanReordenar(BaseModel):
     itens: list[KanbanReordenarItem]
     usuario_id: int | None = None
 
+
 @router.get("/wms/kanban/ordem")
 def kanban_ordem(
     usuario: _dependente,
     tipo: str = Query(..., pattern="^(PEDIDO|SEPARACAO)$"),
     colunas: str = Query(""),
-):
+) -> dict[str, dict[str, int]]:
+    """Posicoes verticais salvas do kanban (globais, por tipo e coluna)."""
     where = ["tipo = :tipo"]
-    params: dict = {"tipo": tipo}
+    params: dict[str, Any] = {"tipo": tipo}
     lista = [c.strip().upper() for c in colunas.split(",") if c.strip()]
     if lista:
         where.append("coluna = ANY(:colunas)")
         params["colunas"] = lista
-    sql = text(f"select chave, coluna, posicao from public.wms_kanban_ordem where {' and '.join(where)}")
-    with engine.begin() as conn:
+    sql = text(
+        "select chave, coluna, posicao from public.wms_kanban_ordem "
+        f"where {' and '.join(where)}"
+    )
+    with warehouse.engine().begin() as conn:
         rows = conn.execute(sql, params).mappings().all()
     res: dict[str, dict[str, int]] = {}
     for r in rows:
@@ -2275,26 +2324,48 @@ def kanban_ordem(
 
 
 @router.post("/wms/kanban/reordenar")
-def kanban_reordenar(usuario: _dependente, dados: KanbanReordenar):
-    with engine.begin() as conn:
+def kanban_reordenar(
+    usuario: _dependente, dados: KanbanReordenar
+) -> dict[str, bool]:
+    """Salva a ordem vertical de uma coluna do kanban."""
+    with warehouse.engine().begin() as conn:
         for item in dados.itens:
+            partes = item.chave.split("|")
             conn.execute(
                 text(
                     """
-                    insert into public.wms_kanban_ordem (tipo, chave, empresa, pedido, separacao_id, coluna, posicao, atualizado_em, atualizado_por)
-                    values (:tipo, :chave, :empresa, :pedido, :separacao_id, :coluna, :posicao, now(), :atualizado_por)
-                    on conflict (tipo,chave,coluna) do update set posicao = excluded.posicao, atualizado_em = now(), atualizado_por = excluded.atualizado_por
+                    insert into public.wms_kanban_ordem
+                        (tipo, chave, empresa, pedido, separacao_id, coluna,
+                         posicao, atualizado_em, atualizado_por)
+                    values
+                        (:tipo, :chave, :empresa, :pedido, :separacao_id,
+                         :coluna, :posicao, now(), :atualizado_por)
+                    on conflict (tipo, chave, coluna) do update
+                        set posicao = excluded.posicao,
+                            atualizado_em = now(),
+                            atualizado_por = excluded.atualizado_por
                     """
                 ),
                 {
                     "tipo": dados.tipo,
                     "chave": item.chave,
-                    "empresa": (item.chave.split("|")[0] if "|" in item.chave else None),
-                    "pedido": (item.chave.split("|")[1] if "|" in item.chave and dados.tipo == "PEDIDO" else None),
-                    "separacao_id": int(item.chave) if dados.tipo == "SEPARACAO" and item.chave.isdigit() else None,
+                    "empresa": partes[0] if len(partes) == 2 else None,
+                    "pedido": (
+                        partes[1]
+                        if len(partes) == 2 and dados.tipo == "PEDIDO"
+                        else None
+                    ),
+                    "separacao_id": (
+                        int(item.chave)
+                        if dados.tipo == "SEPARACAO" and item.chave.isdigit()
+                        else None
+                    ),
                     "coluna": dados.coluna,
                     "posicao": int(item.posicao or 0),
                     "atualizado_por": dados.usuario_id,
                 },
             )
     return {"ok": True}
+
+
+__all__ = ["router"]
