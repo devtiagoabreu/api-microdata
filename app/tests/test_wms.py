@@ -124,6 +124,13 @@ def cenario() -> Any:
             ),
             {**chave, "ultimo": dados["ultimo_evento"]},
         )
+        conn.execute(
+            text(
+                "delete from public.wms_pedidos_arquivados "
+                "where empresa = :empresa and pedido = :pedido"
+            ),
+            chave,
+        )
         if dados["situacao_original"] is None:
             conn.execute(
                 text(
@@ -433,6 +440,143 @@ class TestKanbanPedidos:
             json={"situacaoId": 999999},
         )
         assert resposta.status_code == 404
+
+
+class TestArquivamento:
+    def _cancelar_ordem(self, cenario: dict[str, Any]) -> dict[str, Any]:
+        ordem = _criar(cenario)
+        resposta = client.post(
+            f"/wms/separacoes/{ordem['id']}/cancelar",
+            json={"motivo": "Teste de arquivamento", "usuarioId": 7},
+        )
+        assert resposta.status_code == 200, resposta.text
+        return resposta.json()
+
+    def _arquivar_separacao(self, ordem: dict[str, Any]) -> Any:
+        return client.post(f"/wms/separacoes/{ordem['id']}/arquivar")
+
+    def _listar_separacoes(self, cenario: dict[str, Any], arquivadas: bool) -> list:
+        resposta = client.get(
+            f"/wms/separacoes?busca={cenario['pedido']}"
+            f"&arquivadas={'true' if arquivadas else 'false'}&limite=500"
+        )
+        assert resposta.status_code == 200, resposta.text
+        return resposta.json()["itens"]
+
+    def _arquivar_pedido(self, cenario: dict[str, Any]) -> Any:
+        return client.post(
+            f"/wms/pedidos/{cenario['empresa']}/{cenario['pedido']}/arquivar"
+        )
+
+    def _listar_pedidos(self, cenario: dict[str, Any], arquivados: bool) -> list:
+        resposta = client.get(
+            f"/wms/pedidos?busca={cenario['pedido']}"
+            f"&arquivados={'true' if arquivados else 'false'}&limite=500"
+        )
+        assert resposta.status_code == 200, resposta.text
+        return resposta.json()["itens"]
+
+    def test_arquivar_e_desarquivar_pedido_cancelado(self, cenario):
+        assert _mover(cenario, "CANCELADO").status_code == 200
+
+        resposta = self._arquivar_pedido(cenario)
+        assert resposta.status_code == 200, resposta.text
+        assert resposta.json()["arquivado"] is True
+        assert resposta.json()["arquivadoEm"]
+
+        normal = self._listar_pedidos(cenario, arquivados=False)
+        assert all(item["pedido"] != cenario["pedido"] for item in normal)
+        arquivados = self._listar_pedidos(cenario, arquivados=True)
+        assert any(item["pedido"] == cenario["pedido"] for item in arquivados)
+
+        desarquivar = client.post(
+            f"/wms/pedidos/{cenario['empresa']}/{cenario['pedido']}/desarquivar"
+        )
+        assert desarquivar.status_code == 200, desarquivar.text
+        assert desarquivar.json()["arquivado"] is False
+        assert self._listar_pedidos(cenario, arquivados=False)
+
+    def test_arquivar_pedido_nao_cancelado_da_400(self, cenario):
+        assert _mover(cenario, "LIBERADO").status_code == 200
+        resposta = self._arquivar_pedido(cenario)
+        assert resposta.status_code == 400
+        assert "cancelados" in resposta.json()["detail"]
+
+    def test_mover_pedido_arquivado_desarquiva(self, cenario):
+        assert _mover(cenario, "CANCELADO").status_code == 200
+        assert self._arquivar_pedido(cenario).status_code == 200
+
+        resposta = _mover(cenario, "LIBERADO")
+        assert resposta.status_code == 200, resposta.text
+        assert resposta.json()["arquivado"] is False
+        assert any(
+            item["pedido"] == cenario["pedido"]
+            for item in self._listar_pedidos(cenario, arquivados=False)
+        )
+
+    def test_arquivar_separacao_cancelada(self, cenario):
+        ordem = self._cancelar_ordem(cenario)
+
+        resposta = self._arquivar_separacao(ordem)
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        assert corpo["status"] == "CANCELADO"
+        assert corpo["arquivadaEm"]
+
+        normal = self._listar_separacoes(cenario, arquivadas=False)
+        assert all(item["id"] != ordem["id"] for item in normal)
+        arquivadas = self._listar_separacoes(cenario, arquivadas=True)
+        assert any(item["id"] == ordem["id"] for item in arquivadas)
+
+        desarquivar = client.post(f"/wms/separacoes/{ordem['id']}/desarquivar")
+        assert desarquivar.status_code == 200, desarquivar.text
+        assert desarquivar.json()["arquivadaEm"] is None
+
+    def test_arquivar_separacao_ativa_da_400(self, cenario):
+        ordem = _criar(cenario)
+        resposta = self._arquivar_separacao(ordem)
+        assert resposta.status_code == 400
+        assert "canceladas" in resposta.json()["detail"]
+
+    def test_reabrir_separacao_cancelada_volta_para_producao(self, cenario):
+        ordem = self._cancelar_ordem(cenario)
+        assert self._arquivar_separacao(ordem).status_code == 200
+
+        resposta = client.post(
+            f"/wms/separacoes/{ordem['id']}/reabrir",
+            json={"status": "LIBERADO", "usuarioId": 7},
+        )
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        assert corpo["status"] == "LIBERADO"
+        assert corpo["arquivadaEm"] is None
+        assert corpo["canceladoEm"] is None
+
+        pedido = client.get(
+            f"/wms/pedidos/{cenario['empresa']}/{cenario['pedido']}"
+        ).json()
+        assert pedido["separacaoStatus"] == "LIBERADO"
+        assert self._listar_separacoes(cenario, arquivadas=False)
+
+    def test_reabrir_separacao_em_separacao(self, cenario):
+        ordem = self._cancelar_ordem(cenario)
+        resposta = client.post(
+            f"/wms/separacoes/{ordem['id']}/reabrir",
+            json={"status": "EM_SEPARACAO", "usuarioId": 7},
+        )
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        assert corpo["status"] == "EM_SEPARACAO"
+        assert corpo["iniciadoEm"]
+
+    def test_reabrir_com_status_invalido_da_400(self, cenario):
+        ordem = self._cancelar_ordem(cenario)
+        resposta = client.post(
+            f"/wms/separacoes/{ordem['id']}/reabrir",
+            json={"status": "CANCELADO"},
+        )
+        assert resposta.status_code == 400
+        assert "LIBERADO" in resposta.json()["detail"]
 
 
 class TestFluxoSeparacao:

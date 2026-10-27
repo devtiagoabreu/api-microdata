@@ -103,6 +103,10 @@ class Cancelamento(Acao):
     motivo: str | None = None
 
 
+class Reabertura(Acao):
+    status: str = STATUS_LIBERADO
+
+
 class NovaSeparacao(Modelo):
     empresa: str
     pedido: str
@@ -193,6 +197,8 @@ def _painel(linha: Any) -> dict[str, Any]:
         "concluidoEm": _data(linha["concluido_em"]),
         "canceladoEm": _data(linha["cancelado_em"]),
         "atualizadoEm": _data(linha["atualizado_em"]),
+        "arquivadaEm": _data(linha["arquivada_em"]),
+        "arquivadaPor": linha["arquivada_por"],
         "totalPecas": linha["total_pecas"],
         "totalMetros": _float0(linha["total_metros"]),
         "itensSeparados": linha["itens_separados"],
@@ -592,6 +598,7 @@ def _filtros_pedido(
     *,
     busca: str,
     status_separacao: str,
+    arquivados: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     condicoes: list[str] = []
     params: dict[str, Any] = {}
@@ -606,6 +613,16 @@ def _filtros_pedido(
             "coalesce(st.codigo, 'SEM_SEPARACAO') = :status_separacao"
         )
         params["status_separacao"] = status_separacao
+    if arquivados:
+        condicoes.append(
+            "exists (select 1 from public.wms_pedidos_arquivados arq "
+            "where arq.empresa = p.empresa and arq.pedido = p.pedido)"
+        )
+    else:
+        condicoes.append(
+            "not exists (select 1 from public.wms_pedidos_arquivados arq "
+            "where arq.empresa = p.empresa and arq.pedido = p.pedido)"
+        )
     return (" and " + " and ".join(condicoes) if condicoes else ""), params
 
 
@@ -641,6 +658,7 @@ select
     st.ordem                               as situacao_ordem,
     st.acao                                as situacao_acao,
     st.perfis                              as situacao_perfis,
+    arq.arquivado_em                       as arquivado_em,
     string_agg(distinct pr.descricao, ', ') filter (where pr.descricao is not null) as artigos
 from raw.car_pedido p
 join raw.car_itens_pedido i
@@ -650,6 +668,8 @@ left join raw.clientes_principal c on c.codigo_cliente = p.cliente
 left join public.wms_pedidos_situacao ps
   on ps.empresa = p.empresa and ps.pedido = p.pedido
 left join public.wms_situacoes_pedido st on st.id = ps.situacao_id
+left join public.wms_pedidos_arquivados arq
+  on arq.empresa = p.empresa and arq.pedido = p.pedido
 left join lateral (
     select s2.id, s2.status
     from public.wms_separacoes s2
@@ -670,7 +690,8 @@ group by
     p.empresa, p.pedido, p.cliente, c.razao_nome_cliente,
     p.data_pedido, p.data_entrega, p.status, p.status_ped,
     s.id, s.status,
-    st.id, st.codigo, st.nome, st.cor, st.ordem, st.acao, st.perfis
+    st.id, st.codigo, st.nome, st.cor, st.ordem, st.acao, st.perfis,
+    arq.arquivado_em
 order by p.data_pedido desc, p.pedido desc
 limit :limite offset :offset
 """
@@ -737,6 +758,10 @@ def dashboard(usuario: _dependente) -> dict[str, Any]:
                 select st.codigo, count(*)::int
                 from public.wms_pedidos_situacao ps
                 join public.wms_situacoes_pedido st on st.id = ps.situacao_id
+                where not exists (
+                    select 1 from public.wms_pedidos_arquivados arq
+                    where arq.empresa = ps.empresa and arq.pedido = ps.pedido
+                )
                 group by st.codigo
                 """
             )
@@ -836,10 +861,13 @@ def listar_pedidos(
     ),
     limite: int = Query(50, ge=1, le=LIMITE_MAX),
     offset: int = Query(0, ge=0),
+    arquivados: bool = Query(False, description="Somente pedidos arquivados"),
 ) -> dict[str, Any]:
     """Backlog: pedidos aprovados e abertos no ERP (status 2) com saldo a separar."""
     filtro, params = _filtros_pedido(
-        busca=busca.strip(), status_separacao=status_separacao.strip().upper()
+        busca=busca.strip(),
+        status_separacao=status_separacao.strip().upper(),
+        arquivados=arquivados,
     )
     params.update({"limite": limite, "offset": offset})
     with warehouse.engine().connect() as conn:
@@ -863,6 +891,8 @@ def listar_pedidos(
                 "situacaoAcao": linha["situacao_acao"],
                 "situacaoPerfis": list(linha["situacao_perfis"] or []),
                 "artigos": linha["artigos"],
+                "arquivado": linha["arquivado_em"] is not None,
+                "arquivadoEm": _data(linha["arquivado_em"]),
             }
             for linha in conn.execute(
                 text(SQL_PEDIDOS.format(filtros=filtro)), params
@@ -984,9 +1014,12 @@ def _pedido(conn: Any, empresa: str, pedido: str) -> dict[str, Any]:
                 to_char(p.data_pedido, 'YYYY-MM-DD') as data_pedido,
                 to_char(p.data_entrega, 'YYYY-MM-DD') as data_entrega,
                 p.status,
-                p.status_ped
+                p.status_ped,
+                arq.arquivado_em
             from raw.car_pedido p
             left join raw.clientes_principal c on c.codigo_cliente = p.cliente
+            left join public.wms_pedidos_arquivados arq
+              on arq.empresa = p.empresa and arq.pedido = p.pedido
             where p.empresa = :empresa and p.pedido = :pedido
             """
         ),
@@ -1024,6 +1057,8 @@ def _pedido(conn: Any, empresa: str, pedido: str) -> dict[str, Any]:
         "situacaoOrdem": situacao["ordem"] if situacao else None,
         "situacaoAcao": situacao["acao"] if situacao else None,
         "situacaoPerfis": list(situacao["perfis"] or []) if situacao else [],
+        "arquivado": linha["arquivado_em"] is not None,
+        "arquivadoEm": _data(linha["arquivado_em"]),
         "itens": _itens_pedido(conn, empresa, pedido),
     }
 
@@ -1450,6 +1485,13 @@ def mover_pedido_situacao(
                         ),
                     )
 
+        conn.execute(
+            text(
+                "delete from public.wms_pedidos_arquivados "
+                "where empresa = :empresa and pedido = :pedido"
+            ),
+            {"empresa": empresa, "pedido": pedido},
+        )
         _definir_situacao(
             conn,
             empresa,
@@ -1461,6 +1503,60 @@ def mover_pedido_situacao(
         return _pedido(conn, empresa, pedido)
 
 
+@router.post("/wms/pedidos/{empresa}/{pedido}/arquivar")
+def arquivar_pedido(
+    empresa: str, pedido: str, usuario: _dependente
+) -> dict[str, Any]:
+    """Tira um pedido cancelado do kanban/lista (situacao local, ERP intacto)."""
+    empresa = (empresa or "").strip()
+    pedido = (pedido or "").strip()
+    with warehouse.engine().begin() as conn:
+        if _pedido_erp(conn, empresa, pedido) is None:
+            raise HTTPException(status_code=404, detail="Pedido não encontrado")
+        atual = _situacao_atual(conn, empresa, pedido)
+        if atual is None or atual["codigo"] != STATUS_CANCELADO:
+            raise HTTPException(
+                status_code=400,
+                detail="Só é possível arquivar pedidos cancelados",
+            )
+        conn.execute(
+            text(
+                """
+                insert into public.wms_pedidos_arquivados
+                    (empresa, pedido, situacao_id, arquivado_em, arquivado_por)
+                values (:empresa, :pedido, :situacao_id, now(), NULL)
+                on conflict (empresa, pedido) do update
+                    set situacao_id = excluded.situacao_id,
+                        arquivado_em = now()
+                """
+            ),
+            {"empresa": empresa, "pedido": pedido, "situacao_id": atual["id"]},
+        )
+        return _pedido(conn, empresa, pedido)
+
+
+@router.post("/wms/pedidos/{empresa}/{pedido}/desarquivar")
+def desarquivar_pedido(
+    empresa: str, pedido: str, usuario: _dependente
+) -> dict[str, Any]:
+    """Devolve um pedido arquivado ao kanban/lista."""
+    empresa = (empresa or "").strip()
+    pedido = (pedido or "").strip()
+    with warehouse.engine().begin() as conn:
+        removidos = conn.execute(
+            text(
+                "delete from public.wms_pedidos_arquivados "
+                "where empresa = :empresa and pedido = :pedido"
+            ),
+            {"empresa": empresa, "pedido": pedido},
+        ).rowcount
+        if not removidos:
+            raise HTTPException(
+                status_code=404, detail="Pedido não está arquivado"
+            )
+        return _pedido(conn, empresa, pedido)
+
+
 @router.get("/wms/separacoes")
 def listar_separacoes(
     usuario: _dependente,
@@ -1468,10 +1564,14 @@ def listar_separacoes(
     busca: str = Query("", description="Pedido, cliente (codigo) ou razao social"),
     limite: int = Query(50, ge=1, le=LIMITE_MAX),
     offset: int = Query(0, ge=0),
+    arquivadas: bool = Query(False, description="Somente ordens arquivadas"),
 ) -> dict[str, Any]:
     """Ordens de separacao (kanban/lista)."""
     condicoes: list[str] = []
     params: dict[str, Any] = {"limite": limite, "offset": offset}
+    condicoes.append(
+        "s.arquivada_em is not null" if arquivadas else "s.arquivada_em is null"
+    )
     if status_filtro.strip():
         condicoes.append("s.status = :status")
         params["status"] = status_filtro.strip().upper()
@@ -1856,6 +1956,135 @@ def cancelar_separacao(
             STATUS_CANCELADO,
             usuario_id=dados.usuario_id,
             observacao=_texto(dados.motivo) or _texto(dados.observacao),
+        )
+        return _separacao_por_id(conn, separacao_id)
+
+
+@router.post("/wms/separacoes/{separacao_id}/arquivar")
+def arquivar_separacao(
+    separacao_id: int, usuario: _dependente
+) -> dict[str, Any]:
+    """Tira uma ordem cancelada do kanban/lista, preservando o histórico."""
+    with warehouse.engine().begin() as conn:
+        atual = _travar_separacao(conn, separacao_id)
+        if atual["status"] != STATUS_CANCELADO:
+            raise HTTPException(
+                status_code=400,
+                detail="Só é possível arquivar ordens canceladas",
+            )
+        conn.execute(
+            text(
+                """
+                update public.wms_separacoes
+                set arquivada_em = now(),
+                    arquivada_por = :usuario_id,
+                    atualizado_em = now()
+                where id = :id
+                """
+            ),
+            {"id": separacao_id, "usuario_id": None},
+        )
+        _evento(conn, separacao_id, "ARQUIVADA")
+        return _separacao_por_id(conn, separacao_id)
+
+
+@router.post("/wms/separacoes/{separacao_id}/desarquivar")
+def desarquivar_separacao(
+    separacao_id: int, usuario: _dependente
+) -> dict[str, Any]:
+    """Devolve uma ordem cancelada arquivada ao kanban/lista."""
+    with warehouse.engine().begin() as conn:
+        atual = _travar_separacao(conn, separacao_id)
+        if atual["arquivada_em"] is None:
+            raise HTTPException(
+                status_code=404, detail="Ordem não está arquivada"
+            )
+        conn.execute(
+            text(
+                """
+                update public.wms_separacoes
+                set arquivada_em = null,
+                    arquivada_por = null,
+                    atualizado_em = now()
+                where id = :id
+                """
+            ),
+            {"id": separacao_id},
+        )
+        _evento(conn, separacao_id, "DESARQUIVADA")
+        return _separacao_por_id(conn, separacao_id)
+
+
+@router.post("/wms/separacoes/{separacao_id}/reabrir")
+def reabrir_separacao(
+    separacao_id: int,
+    dados: Reabertura | None = None,
+    usuario: _dependente = None,
+) -> dict[str, Any]:
+    """Devolve uma ordem cancelada ao fluxo de producao (libera as pecas)."""
+    dados = dados or Reabertura()
+    novo_status = (dados.status or STATUS_LIBERADO).strip().upper()
+    if novo_status not in STATUS_ATIVOS:
+        raise HTTPException(
+            status_code=400,
+            detail="Status inválido: use LIBERADO ou EM_SEPARACAO",
+        )
+    with warehouse.engine().begin() as conn:
+        atual = _travar_separacao(conn, separacao_id)
+        if atual["status"] != STATUS_CANCELADO:
+            raise HTTPException(
+                status_code=400,
+                detail="Só é possível reabrir ordens canceladas",
+            )
+        conn.execute(
+            text(
+                """
+                update public.wms_separacoes
+                set status = :status,
+                    arquivada_em = null,
+                    arquivada_por = null,
+                    motivo_cancelamento = null,
+                    cancelado_por = null,
+                    cancelado_em = null,
+                    iniciado_em = case when :em_separacao
+                                       then now() else null end,
+                    iniciado_por = case when :em_separacao
+                                        then :usuario_id else null end,
+                    concluido_em = null,
+                    concluido_por = null,
+                    atualizado_em = now()
+                where id = :id
+                """
+            ),
+            {
+                "id": separacao_id,
+                "status": novo_status,
+                "em_separacao": novo_status == STATUS_EM_SEPARACAO,
+                "usuario_id": dados.usuario_id,
+            },
+        )
+        conn.execute(
+            text(
+                "delete from public.wms_pedidos_arquivados "
+                "where empresa = :empresa and pedido = :pedido"
+            ),
+            {"empresa": atual["empresa"], "pedido": atual["pedido"]},
+        )
+        _evento(
+            conn,
+            separacao_id,
+            "REABERTA",
+            descricao=_texto(dados.observacao),
+            usuario_id=dados.usuario_id,
+            payload={"status": novo_status},
+        )
+        _definir_situacao(
+            conn,
+            atual["empresa"],
+            atual["pedido"],
+            novo_status,
+            usuario_id=dados.usuario_id,
+            observacao=_texto(dados.observacao),
         )
         return _separacao_por_id(conn, separacao_id)
 
