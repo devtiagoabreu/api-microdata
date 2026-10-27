@@ -622,7 +622,7 @@ def _filtros_pedido(
         condicoes.append(
             "not exists (select 1 from public.wms_pedidos_arquivados arq "
             "where arq.empresa = p.empresa and arq.pedido = p.pedido)"
-            " and coalesce(st.codigo, 'SEM_SEPARACAO') <> 'CANCELADO'"
+            " and coalesce(st.codigo, 'SEM_SEPARACAO') not in ('CANCELADO', 'ENVIADO')"
         )
     return (" and " + " and ".join(condicoes) if condicoes else ""), params
 
@@ -652,7 +652,14 @@ select
         ) as double precision
     )                                      as saldo_metros,
     s.id                                   as separacao_id,
-    coalesce(st.codigo, 'SEM_SEPARACAO')   as situacao_codigo,
+    case
+        when coalesce(st.codigo, 'SEM_SEPARACAO') in ('CANCELADO', 'ENVIADO')
+            then coalesce(st.codigo, 'SEM_SEPARACAO')
+        when count(i.item) = sum(case when coalesce(i.qtde_fat, 0) >= i.qtde then 1 else 0 end)
+             and count(i.item) > 0
+            then 'FATURADO'
+        else coalesce(st.codigo, 'SEM_SEPARACAO')
+    end                                    as situacao_codigo,
     st.id                                  as situacao_id,
     st.nome                                as situacao_nome,
     st.cor                                 as situacao_cor,

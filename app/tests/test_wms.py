@@ -264,7 +264,11 @@ class TestPedidos:
 
     def test_filtro_sem_separacao(self):
         corpo = client.get("/wms/pedidos?statusSeparacao=SEM_SEPARACAO&limite=5").json()
-        assert all(item["separacaoStatus"] == "SEM_SEPARACAO" for item in corpo["itens"])
+        # Pedidos totalmente faturados aparecem como FATURADO (sobrescrita automática)
+        assert all(
+            item["separacaoStatus"] in ("SEM_SEPARACAO", "FATURADO")
+            for item in corpo["itens"]
+        )
 
     def test_detalhe_com_itens(self, cenario):
         resposta = client.get(
