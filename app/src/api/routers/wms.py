@@ -2103,9 +2103,11 @@ def _condicoes_estoque(
     if busca:
         condicoes.append(
             "(a.nro_rolo ilike :busca or a.nro_peca ilike :busca "
-            "or a.produto ilike :busca or a.cor ilike :busca)"
+            "or a.produto ilike :busca or a.cor ilike :busca "
+            "or pr.descricao ilike :busca_desc)"
         )
         params["busca"] = f"%{busca}%"
+        params["busca_desc"] = f"%{busca}%"
     for valor, coluna in (
         (gaveta, "a.gaveta"),
         (sub_lote, "a.sub_lote"),
@@ -2115,8 +2117,8 @@ def _condicoes_estoque(
     ):
         if valor:
             nome = f"f_{coluna.split('.')[-1]}"
-            condicoes.append(f"{coluna} = :{nome}")
-            params[nome] = valor
+            condicoes.append(f"{coluna} ilike :{nome}")
+            params[nome] = f"%{valor}%"
     return (" and " + " and ".join(condicoes) if condicoes else ""), params
 
 
@@ -2177,6 +2179,7 @@ def _disponiveis(
     contar = f"""
         select count(*)::int
         from raw.cte_peca a
+        left join raw.produtos pr on pr.codigo = a.produto
         where {SQL_ABERTAS}
           and {SQL_RESERVADAS}
           {filtros}
@@ -2241,6 +2244,64 @@ def listar_estoque(
             conn, filtros=filtros, params=params, limite=limite, offset=offset
         )
     return {"itens": itens, "total": total}
+
+
+@router.get("/wms/pedidos/{empresa}/{pedido}/itens/{item}/estoque-disponivel")
+def estoque_disponivel_para_item(
+    empresa: str,
+    pedido: str,
+    item: int,
+    usuario: _dependente,
+    limite: int = Query(200, ge=1, le=LIMITE_MAX),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """Peças em aberto compatíveis com o item do pedido, para verificar capacidade de suprimento."""
+    with warehouse.engine().connect() as conn:
+        item_pedido = _item_do_pedido(conn, empresa, pedido, item)
+        filtros, params = _condicoes_estoque(
+            busca="", gaveta="", sub_lote="", aviso="", cor="", produto=""
+        )
+        for coluna in ("produto", "situacao", "cor", "desenho", "variante", "categoria"):
+            valor = item_pedido[coluna]
+            if valor is None:
+                filtros += f" and a.{coluna} is null"
+            else:
+                filtros += f" and a.{coluna} = :item_{coluna}"
+                params[f"item_{coluna}"] = valor
+        params["limite"] = limite
+        params["offset"] = offset
+        itens, total = _disponiveis(
+            conn, filtros=filtros, params=params, limite=limite, offset=offset
+        )
+
+    total_metros = sum((linha["metros"] or 0) for linha in itens)
+    saldo = item_pedido["saldo"] or 0
+    percentual = (total_metros / saldo * 100) if saldo > 0 else 0
+    return {
+        "item": {
+            "item": item_pedido["item"],
+            "produto": item_pedido["produto"],
+            "produto_desc": item_pedido["produto_desc"],
+            "situacao": item_pedido["situacao"],
+            "situacao_desc": item_pedido["situacao_desc"],
+            "cor": item_pedido["cor"],
+            "cor_desc": item_pedido["cor_desc"],
+            "desenho": item_pedido["desenho"],
+            "desenho_desc": item_pedido["desenho_desc"],
+            "variante": item_pedido["variante"],
+            "variante_desc": item_pedido["variante_desc"],
+            "categoria": item_pedido["categoria"],
+            "categoria_desc": item_pedido["categoria_desc"],
+            "largura": item_pedido["largura"],
+            "saldo": _float0(item_pedido["saldo"]),
+            "unid": item_pedido["unid"],
+        },
+        "itens": itens,
+        "total": total,
+        "totalMetrosDisponiveis": total_metros,
+        "saldoItem": saldo,
+        "percentualCapacidade": round(min(percentual, 100), 1) if saldo > 0 else 0,
+    }
 
 
 @router.get("/wms/separacoes/{separacao_id}/itens/{item}/pecas")
