@@ -622,6 +622,7 @@ def _filtros_pedido(
         condicoes.append(
             "not exists (select 1 from public.wms_pedidos_arquivados arq "
             "where arq.empresa = p.empresa and arq.pedido = p.pedido)"
+            " and coalesce(st.codigo, 'SEM_SEPARACAO') <> 'CANCELADO'"
         )
     return (" and " + " and ".join(condicoes) if condicoes else ""), params
 
@@ -692,7 +693,7 @@ group by
     s.id, s.status,
     st.id, st.codigo, st.nome, st.cor, st.ordem, st.acao, st.perfis,
     arq.arquivado_em
-order by p.data_pedido desc, p.pedido desc
+order by p.data_entrega asc nulls last, p.pedido
 limit :limite offset :offset
 """
 
