@@ -73,6 +73,7 @@ def _cenario() -> dict[str, Any] | None:
           and coalesce(p.status_ped, '') <> 'E'
           and coalesce(i.status_item, '') <> 'E'
           and (i.qtde - coalesce(i.qtde_romaneio, 0) - coalesce(i.qtde_acerto, 0)) > 0
+          and coalesce(i.liberado, 'S') <> 'N'
           and not exists (
               select 1
               from public.wms_separacoes s
@@ -260,6 +261,7 @@ class TestPedidos:
             "LIBERADO",
             "EM_SEPARACAO",
             "SEPARADO",
+            "FATURADO",
         )
 
     def test_filtro_sem_separacao(self):

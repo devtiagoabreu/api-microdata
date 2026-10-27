@@ -693,6 +693,7 @@ where p.status = '2'
   and (
       i.qtde - coalesce(i.qtde_romaneio, 0) - coalesce(i.qtde_acerto, 0)
   ) > 0
+  and coalesce(i.liberado, 'S') = 'S'
   {filtros}
 group by
     p.empresa, p.pedido, p.cliente, c.razao_nome_cliente,
@@ -730,6 +731,7 @@ from (
       and (
           i.qtde - coalesce(i.qtde_romaneio, 0) - coalesce(i.qtde_acerto, 0)
       ) > 0
+      and coalesce(i.liberado, 'S') = 'S'
       {filtros}
     group by p.empresa, p.pedido, s.id, s.status, st.codigo
 ) t
