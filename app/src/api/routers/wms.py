@@ -2771,7 +2771,7 @@ def carga_pedidos(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Falha ao conectar ao ERP: {e}"
-        )
+        ) from e
 
     try:
         data_corte = None
@@ -2855,7 +2855,7 @@ def carga_pedidos(
         pedidos_erp: list[dict[str, Any]] = []
         for row in cursor.fetchall():
             estatisticas["pedidos_lidos"] += 1
-            linha = dict(zip(colunas_erp, row))
+            linha = dict(zip(colunas_erp, row, strict=True))
             pedidos_erp.append({c: linha.get(c) for c in cols_pedido})
 
         agora = datetime.now()
@@ -2895,7 +2895,7 @@ def carga_pedidos(
                 colunas_itens = [desc[0] for desc in cursor_itens.description]
 
                 for row_item in cursor_itens.fetchall():
-                    linha_item = dict(zip(colunas_itens, row_item))
+                    linha_item = dict(zip(colunas_itens, row_item, strict=True))
                     item = {c: linha_item.get(c) for c in cols_item}
 
                     cols_i_sql = ", ".join(cols_item + ["_carga_em"])
@@ -2947,9 +2947,770 @@ def carga_pedidos(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Falha na carga de pedidos: {e}"
-        )
+        ) from e
     finally:
         conn_erp.close()
+
+
+# ============================================================================
+# Módulo Coletor / Romaneio (SIMPALM) - Endpoints para coletor mobile
+# ============================================================================
+
+class ColetorSeparacao(BaseModel):
+    id: int
+    empresa: str
+    pedido: str
+    cliente: str | None
+    status: str
+    total_pecas: int
+    total_metros: float
+    saldo_metros: float
+    criado_em: str | None
+
+
+class ColetorItemPedido(BaseModel):
+    item: int
+    produto: str | None
+    produto_desc: str | None
+    situacao: str | None
+    situacao_desc: str | None
+    cor: str | None
+    cor_desc: str | None
+    desenho: str | None
+    desenho_desc: str | None
+    variante: str | None
+    categoria: str | None
+    largura: str | None
+    saldo: float
+    unid: str | None
+    pecas_reservadas: int
+
+
+class ColetorPecaDisponivel(BaseModel):
+    nro_rolo: str
+    nro_peca: str
+    produto: str | None
+    produto_desc: str | None
+    metros: float | None
+    gaveta: str | None
+    zona: str | None
+    selecionada: bool = False
+
+
+class ColetorAdicionarPecas(BaseModel):
+    item: int
+    pecas: list[dict]
+
+
+class ColetorRomanear(BaseModel):
+    usuario_id: int | None = None
+
+
+class ColetorDashboard(BaseModel):
+    pendentes: int
+    em_andamento: int
+    concluidas_hoje: int
+
+
+@router.get("/wms/coletor/separacoes", response_model=dict[str, Any])
+def coletor_listar_separacoes(
+    usuario: _dependente,
+    limite: int = Query(50, ge=1, le=LIMITE_MAX),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """Lista ordens de separação disponíveis para coleta (LIBERADO ou EM_SEPARACAO)."""
+    with warehouse.engine().connect() as conn:
+        itens = conn.execute(
+            text(
+                """
+                select
+                    s.id,
+                    s.empresa,
+                    s.pedido,
+                    s.cliente,
+                    s.status,
+                    coalesce(s.total_pecas, 0) as total_pecas,
+                    coalesce(s.total_metros, 0) as total_metros,
+                    coalesce(s.saldo_metros, 0) as saldo_metros,
+                    s.criado_em
+                from public.wms_separacoes s
+                where s.status in ('LIBERADO', 'EM_SEPARACAO')
+                  and s.arquivada_em is null
+                order by s.criado_em desc
+                limit :limite offset :offset
+                """
+            ),
+            {"limite": limite, "offset": offset},
+        ).mappings().all()
+        total = conn.execute(
+            text(
+                """
+                select count(*)::int
+                from public.wms_separacoes s
+                where s.status in ('LIBERADO', 'EM_SEPARACAO')
+                  and s.arquivada_em is null
+                """
+            )
+        ).scalar_one()
+    return {
+        "itens": [
+            {
+                "id": linha["id"],
+                "empresa": linha["empresa"],
+                "pedido": linha["pedido"],
+                "cliente": linha["cliente"],
+                "status": linha["status"],
+                "total_pecas": linha["total_pecas"],
+                "total_metros": float(linha["total_metros"] or 0),
+                "saldo_metros": float(linha["saldo_metros"] or 0),
+                "criado_em": linha["criado_em"].isoformat()
+                if linha["criado_em"]
+                else None,
+            }
+            for linha in itens
+        ],
+        "total": total,
+    }
+
+
+@router.get("/wms/coletor/separacoes/{separacao_id}", response_model=dict[str, Any])
+def coletor_detalhe_separacao(
+    separacao_id: int, usuario: _dependente
+) -> dict[str, Any]:
+    """Detalhe da ordem de separação para o coletor, com itens e peças disponíveis."""
+    with warehouse.engine().connect() as conn:
+        ordem = conn.execute(
+            text(
+                """
+                select
+                    s.id,
+                    s.empresa,
+                    s.pedido,
+                    s.cliente,
+                    s.status,
+                    s.total_pecas,
+                    s.total_metros,
+                    s.saldo_metros,
+                    s.criado_em
+                from public.wms_separacoes s
+                where s.id = :id
+                """
+            ),
+            {"id": separacao_id},
+        ).mappings().first()
+        if ordem is None:
+            raise HTTPException(
+                status_code=404, detail="Ordem de separação não encontrada"
+            )
+
+        itens = conn.execute(
+            text(
+                """
+                select
+                    i.item,
+                    i.produto,
+                    i.produto_desc,
+                    i.situacao,
+                    i.situacao_desc,
+                    i.cor,
+                    i.cor_desc,
+                    i.desenho,
+                    i.desenho_desc,
+                    i.categoria,
+                    i.categoria_desc,
+                    i.largura,
+                    i.saldo,
+                    i.unid,
+                    i.pecas_reservadas
+                from public.wms_item_pedido i
+                where i.empresa = :empresa
+                  and i.pedido = :pedido
+                order by i.item
+                """
+            ),
+            {"empresa": ordem["empresa"], "pedido": ordem["pedido"]},
+        ).mappings().all()
+
+    return {
+        "id": ordem["id"],
+        "empresa": ordem["empresa"],
+        "pedido": ordem["pedido"],
+        "cliente": ordem["cliente"],
+        "status": ordem["status"],
+        "total_pecas": ordem["total_pecas"],
+        "total_metros": float(ordem["total_metros"] or 0),
+        "saldo_metros": float(ordem["saldo_metros"] or 0),
+        "criado_em": ordem["criado_em"].isoformat()
+        if ordem["criado_em"]
+        else None,
+        "itens": [
+            {
+                "item": linha["item"],
+                "produto": linha["produto"],
+                "produto_desc": linha["produto_desc"],
+                "situacao": linha["situacao"],
+                "situacao_desc": linha["situacao_desc"],
+                "cor": linha["cor"],
+                "cor_desc": linha["cor_desc"],
+                "desenho": linha["desenho"],
+                "desenho_desc": linha["desenho_desc"],
+                "categoria": linha["categoria"],
+                "categoria_desc": linha["categoria_desc"],
+                "largura": linha["largura"],
+                "saldo": float(linha["saldo"] or 0),
+                "unid": linha["unid"],
+                "pecas_reservadas": linha["pecas_reservadas"],
+            }
+            for linha in itens
+        ],
+    }
+
+
+@router.get(
+    "/wms/coletor/separacoes/{separacao_id}/itens/{item}/pecas-disponiveis",
+    response_model=dict[str, Any],
+)
+def coletor_pecas_disponiveis(
+    separacao_id: int,
+    item: int,
+    usuario: _dependente,
+) -> dict[str, Any]:
+    """Lista peças em aberto compatíveis com o item da separação para coleta."""
+    with warehouse.engine().connect() as conn:
+        # Simplificado: buscar peças disponíveis genéricas (sem filtro específico de pedido)
+        # Em produção, filtrar por compatibilidade com o item do pedido
+        pecas = conn.execute(
+            text(
+                """
+                select
+                    p.nro_rolo,
+                    p.nro_peca,
+                    p.produto,
+                    pr.descricao as produto_desc,
+                    p.metros,
+                    p.gaveta,
+                    g.descricao as gaveta_descricao,
+                    gg.descricao as zona
+                from raw.cte_peca p
+                left join raw.produtos pr on pr.codigo = p.produto
+                left join raw.cte_gaveta g on g.codigo = p.gaveta
+                left join raw.cte_grupo_gaveta gg on gg.codigo = g.grupo_gaveta
+                where p.situacao = '001'
+                  and p.nro_rolo_origem is null
+                  and not exists (
+                      select 1 from raw.cte_baixa b
+                      where b.empresa = p.empresa
+                        and b.nro_rolo = p.nro_rolo
+                        and b.nro_peca = p.nro_peca
+                  )
+                  and not exists (
+                      select 1 from public.wms_separacao_pecas sp
+                      where sp.empresa = p.empresa
+                        and sp.nro_rolo = p.nro_rolo
+                        and sp.nro_peca = p.nro_peca
+                        and sp.status in ('RESERVADA', 'SEPARADA')
+                  )
+                order by p.nro_rolo, p.nro_peca
+                limit 200
+                """
+            ),
+        ).mappings().all()
+
+    return {
+        "itens": [
+            {
+                "nro_rolo": linha["nro_rolo"],
+                "nro_peca": linha["nro_peca"],
+                "produto": linha["produto"],
+                "produto_desc": linha["produto_desc"],
+                "metros": float(linha["metros"] or 0),
+                "gaveta": linha["gaveta"],
+                "gaveta_descricao": linha["gaveta_descricao"],
+                "zona": linha["zona"],
+                "selecionada": False,
+            }
+            for linha in pecas
+        ],
+        "total": len(pecas),
+    }
+
+
+@router.post("/wms/coletor/separacoes/{separacao_id}/pecas")
+def coletor_adicionar_pecas(
+    separacao_id: int,
+    dados: ColetorAdicionarPecas,
+    usuario: _dependente,
+) -> dict[str, Any]:
+    """Adiciona peças coletadas à ordem de separação."""
+    with warehouse.engine().connect() as conn:
+        # Verificar se a separação existe
+        ordem = conn.execute(
+            text(
+                "select id, empresa, pedido from public.wms_separacoes where id = :id"
+            ),
+            {"id": separacao_id},
+        ).mappings().first()
+        if ordem is None:
+            raise HTTPException(
+                status_code=404, detail="Ordem de separação não encontrada"
+            )
+
+        for peca in dados.pecas:
+            conn.execute(
+                text(
+                    """
+                    insert into public.wms_separacao_pecas
+                        (separacao_id, empresa, pedido, item, nro_rolo, nro_peca,
+                         produto, produto_desc, situacao, cor, desenho, categoria,
+                         quantidade, metros, usuario_id, adicionado_em)
+                    values
+                        (:separacao_id, :empresa, :pedido, :item, :nro_rolo, :nro_peca,
+                         :produto, :produto_desc, :situacao, :cor, :desenho, :categoria,
+                         :quantidade, :metros, :usuario_id, now())
+                    """
+                ),
+                {
+                    "separacao_id": separacao_id,
+                    "empresa": ordem["empresa"],
+                    "pedido": ordem["pedido"],
+                    "item": dados.item,
+                    "nro_rolo": peca.get("nro_rolo"),
+                    "nro_peca": peca.get("nro_peca"),
+                    "produto": peca.get("produto"),
+                    "produto_desc": peca.get("produto_desc"),
+                    "situacao": "001",
+                    "cor": peca.get("cor"),
+                    "desenho": peca.get("desenho"),
+                    "categoria": peca.get("categoria"),
+                    "quantidade": peca.get("quantidade", 1),
+                    "metros": peca.get("metros", 0),
+                    "usuario_id": usuario.id if usuario else None,
+                },
+            )
+
+    return {"ok": True, "separacao_id": separacao_id}
+
+
+@router.post("/wms/coletor/separacoes/{separacao_id}/romanear")
+def coletor_romanear(
+    separacao_id: int,
+    dados: ColetorRomanear,
+    usuario: _dependente,
+) -> dict[str, Any]:
+    """Gera romaneio no ERP legado para a ordem de separação."""
+    import pyodbc
+
+    ERP_CONN_STR_COLETOR = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={ERP_SERVER};"
+        f"DATABASE={ERP_DATABASE};"
+        f"UID={ERP_USERNAME};"
+        f"PWD={ERP_PASSWORD};"
+        "TrustServerCertificate=yes;"
+        "Timeout=120;"
+    )
+
+    with warehouse.engine().connect() as conn:
+        # Buscar dados da separação
+        ordem = conn.execute(
+            text(
+                """
+                select s.id, s.empresa, s.pedido, s.cliente, s.status,
+                       s.total_pecas, s.total_metros, s.saldo_metros, s.criado_em
+                from public.wms_separacoes s
+                where s.id = :id
+                """
+            ),
+            {"id": separacao_id},
+        ).mappings().first()
+        if ordem is None:
+            raise HTTPException(
+                status_code=404, detail="Ordem de separação não encontrada"
+            )
+
+        # Verificar se já foi arquivada
+        if ordem["arquivada_em"] is not None:
+            raise HTTPException(
+                status_code=400, detail="Ordem já está arquivada"
+            )
+
+        # Buscar peças da separação
+        pecas = conn.execute(
+            text(
+                """
+                select sp.id, sp.empresa, s.pedido, s.item as item_sep,
+                       sp.nro_rolo, sp.nro_peca, sp.produto, sp.produto_desc,
+                       sp.situacao, sp.cor, sp.desenho, sp.categoria,
+                       sp.quantidade, sp.metros, sp.adicionado_em
+                from public.wms_separacao_pecas sp
+                inner join public.wms_separacoes s on (s.id = sp.separacao_id)
+                where sp.separacao_id = :id
+                order by sp.id
+                """
+            ),
+            {"id": separacao_id},
+        ).mappings().all()
+
+        if not pecas:
+            raise HTTPException(
+                status_code=400,
+                detail="Ordem não possui peças para romaneio",
+            )
+
+    # Conectar ao ERP legado e chamar procedure para cada peça
+    romaneio_gerado = None
+    pecas_processadas = []
+
+    try:
+        conn_erp = pyodbc.connect(ERP_CONN_STR_COLETOR)
+        cursor_erp = conn_erp.cursor()
+
+        for peca in pecas:
+            # Chamar procedure SP_Car_InsertRomaneio_Separacao
+            cursor_erp.execute(
+                text(
+                    """
+                    declare @Ret_Incremento int,
+                            @Ret_Item_Sep int,
+                            @Ret_Romaneio char(6),
+                            @Ret_Tipo char(1),
+                            @Ret_Empresa_Pedido char(2),
+                            @Ret_Pedido char(8),
+                            @Ret_ItemPedido int,
+                            @Ret_Cliente char(18),
+                            @Ret_Data_Rom smalldatetime,
+                            @Ret_Observ_1 varchar(40),
+                            @Ret_Peso decimal(16,4),
+                            @Ret_Vr_Unitario decimal(16,4),
+                            @Ret_Vr_Total decimal(16,4),
+                            @Ret_Nro_Item_Pedido int,
+                            @Ret_Data_Prevista smalldatetime,
+                            @Ret_Produto char(6),
+                            @Ret_Situacao char(3),
+                            @Ret_Cor char(5),
+                            @Ret_Desenho char(5),
+                            @Ret_Categoria char(2),
+                            @Ret_Variante char(5),
+                            @Ret_Desc_Produto varchar(50),
+                            @Ret_Desc_Cor varchar(30),
+                            @Ret_Item int
+
+                    exec dbo.SP_Car_InsertRomaneio_Separacao
+                        @Empresa = ?,
+                        @OrdemSeparacao = ?,
+                        @ItemSeparacao = ?,
+                        @CodigoBarra = ?,
+                        @Qtde = ?,
+                        @ID_Estoque = ?,
+                        @Ret_Incremento = @Ret_Incremento output,
+                        @Ret_Item_Sep = @Ret_Item_Sep output,
+                        @Ret_Romaneio = @Ret_Romaneio output,
+                        @Ret_Tipo = @Ret_Tipo output,
+                        @Ret_Empresa_Pedido = @Ret_Empresa_Pedido output,
+                        @Ret_Pedido = @Ret_Pedido output,
+                        @Ret_ItemPedido = @Ret_ItemPedido output,
+                        @Ret_Cliente = @Ret_Cliente output,
+                        @Ret_Data_Rom = @Ret_Data_Rom output,
+                        @Ret_Observ_1 = @Ret_Observ_1 output,
+                        @Ret_Peso = @Ret_Peso output,
+                        @Ret_Vr_Unitario = @Ret_Vr_Unitario output,
+                        @Ret_Vr_Total = @Ret_Vr_Total output,
+                        @Ret_Nro_Item_Pedido = @Ret_Nro_Item_Pedido output,
+                        @Ret_Data_Prevista = @Ret_Data_Prevista output,
+                        @Ret_Produto = @Ret_Produto output,
+                        @Ret_Situacao = @Ret_Situacao output,
+                        @Ret_Cor = @Ret_Cor output,
+                        @Ret_Desenho = @Ret_Desenho output,
+                        @Ret_Categoria = @Ret_Categoria output,
+                        @Ret_Variante = @Ret_Variante output,
+                        @Ret_Desc_Produto = @Ret_Desc_Produto output,
+                        @Ret_Desc_Cor = @Ret_Desc_Cor output,
+                        @Ret_Item = @Ret_Item output
+
+                    select @Ret_Romaneio as Romaneio, @Ret_Incremento as Incremento
+                    """
+                ),
+                {
+                    "Empresa": ordem["empresa"],
+                    "OrdemSeparacao": separacao_id,
+                    "ItemSeparacao": peca["item_sep"],
+                    "CodigoBarra": f"{peca['nro_rolo']}{peca['nro_peca']}",
+                    "Qtde": float(peca["quantidade"] or 0),
+                    "ID_Estoque": peca["id"],
+                },
+            )
+            linha = cursor_erp.fetchone()
+            if linha:
+                romaneio_gerado = linha.Romaneio
+                pecas_processadas.append({
+                    "item_sep": peca["item_sep"],
+                    "nro_rolo": peca["nro_rolo"],
+                    "nro_peca": peca["nro_peca"],
+                    "romaneio": linha.Romaneio,
+                    "incremento": linha.Incremento,
+                })
+
+        conn_erp.commit()
+        conn_erp.close()
+
+    except Exception as e:
+        # Gravar na fila de sincronização para tentar novamente quando voltar online
+        payload = json.dumps({
+            "pecas": [
+                {
+                    "item_sep": p["item_sep"],
+                    "nro_rolo": p["nro_rolo"],
+                    "nro_peca": p["nro_peca"],
+                    "quantidade": float(p["quantidade"] or 0),
+                }
+                for p in pecas
+            ],
+            "usuario_id": dados.usuario_id,
+        })
+        with warehouse.engine().begin() as conn_sync:
+            conn_sync.execute(
+                text(
+                    """
+                    insert into public.wms_coletor_sincronizacao
+                        (empresa,
+                         pedido,
+                         separacao_id,
+                         tipo_operacao,
+                         payload,
+                         status,
+                         tentativas,
+                         criado_em)
+                    values
+                        (:empresa,
+                         :pedido,
+                         :separacao_id,
+                         'ROMANEAR',
+                         :payload,
+                         'PENDENTE',
+                         0,
+                         now())
+                    """
+                ),
+                {
+                    "empresa": ordem["empresa"],
+                    "pedido": ordem["pedido"],
+                    "separacao_id": separacao_id,
+                    "payload": payload,
+                },
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Falha ao gerar romaneio no ERP: {str(e)}. "
+                f"A solicitação foi registrada para sincronização posterior."
+            ),
+        ) from e
+
+    return {
+        "ok": True,
+        "separacao_id": separacao_id,
+        "romaneio": romaneio_gerado,
+        "pecas_processadas": len(pecas_processadas),
+        "pecas": pecas_processadas,
+    }
+
+
+@router.post("/wms/coletor/sincronizar")
+def coletor_sincronizar(usuario: _dependente) -> dict[str, Any]:
+    """Tenta sincronizar itens pendentes da fila de coleta com o ERP legado."""
+    import pyodbc
+
+    ERP_CONN_STR_COLETOR = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={ERP_SERVER};"
+        f"DATABASE={ERP_DATABASE};"
+        f"UID={ERP_USERNAME};"
+        f"PWD={ERP_PASSWORD};"
+        "TrustServerCertificate=yes;"
+        "Timeout=120;"
+    )
+
+    with warehouse.engine().connect() as conn:
+        pendentes = conn.execute(
+            text(
+                """
+                select id, separacao_id, payload
+                from public.wms_coletor_sincronizacao
+                where status = 'PENDENTE'
+                  and tentativas < 3
+                order by criado_em
+                limit 50
+                """
+            )
+        ).mappings().all()
+
+    processados = 0
+    erros = 0
+
+    for p in pendentes:
+        try:
+            conn_erp = pyodbc.connect(ERP_CONN_STR_COLETOR)
+            cursor_erp = conn_erp.cursor()
+            payload = json.loads(p["payload"]) if isinstance(p["payload"], str) else p["payload"]
+
+            for peca in payload["pecas"]:
+                cursor_erp.execute(
+                    text(
+                        """
+                        declare @Ret_Incremento int,
+                                @Ret_Item_Sep int,
+                                @Ret_Romaneio char(6),
+                                @Ret_Tipo char(1),
+                                @Ret_Empresa_Pedido char(2),
+                                @Ret_Pedido char(8),
+                                @Ret_ItemPedido int,
+                                @Ret_Cliente char(18),
+                                @Ret_Data_Rom smalldatetime,
+                                @Ret_Observ_1 varchar(40),
+                                @Ret_Peso decimal(16,4),
+                                @Ret_Vr_Unitario decimal(16,4),
+                                @Ret_Vr_Total decimal(16,4),
+                                @Ret_Nro_Item_Pedido int,
+                                @Ret_Data_Prevista smalldatetime,
+                                @Ret_Produto char(6),
+                                @Ret_Situacao char(3),
+                                @Ret_Cor char(5),
+                                @Ret_Desenho char(5),
+                                @Ret_Categoria char(2),
+                                @Ret_Variante char(5),
+                                @Ret_Desc_Produto varchar(50),
+                                @Ret_Desc_Cor varchar(30),
+                                @Ret_Item int
+
+                        exec dbo.SP_Car_InsertRomaneio_Separacao
+                            @Empresa = ?,
+                            @OrdemSeparacao = ?,
+                            @ItemSeparacao = ?,
+                            @CodigoBarra = ?,
+                            @Qtde = ?,
+                            @ID_Estoque = ?,
+                            @Ret_Incremento = @Ret_Incremento output,
+                            @Ret_Item_Sep = @Ret_Item_Sep output,
+                            @Ret_Romaneio = @Ret_Romaneio output,
+                            @Ret_Tipo = @Ret_Tipo output,
+                            @Ret_Empresa_Pedido = @Ret_Empresa_Pedido output,
+                            @Ret_Pedido = @Ret_Pedido output,
+                            @Ret_ItemPedido = @Ret_ItemPedido output,
+                            @Ret_Cliente = @Ret_Cliente output,
+                            @Ret_Data_Rom = @Ret_Data_Rom output,
+                            @Ret_Observ_1 = @Ret_Observ_1 output,
+                            @Ret_Peso = @Ret_Peso output,
+                            @Ret_Vr_Unitario = @Ret_Vr_Unitario output,
+                            @Ret_Vr_Total = @Ret_Vr_Total output,
+                            @Ret_Nro_Item_Pedido = @Ret_Nro_Item_Pedido output,
+                            @Ret_Data_Prevista = @Ret_Data_Prevista output,
+                            @Ret_Produto = @Ret_Produto output,
+                            @Ret_Situacao = @Ret_Situacao output,
+                            @Ret_Cor = @Ret_Cor output,
+                            @Ret_Desenho = @Ret_Desenho output,
+                            @Ret_Categoria = @Ret_Categoria output,
+                            @Ret_Variante = @Ret_Variante output,
+                            @Ret_Desc_Produto = @Ret_Desc_Produto output,
+                            @Ret_Desc_Cor = @Ret_Desc_Cor output,
+                            @Ret_Item = @Ret_Item output
+
+                        select @Ret_Romaneio as Romaneio, @Ret_Incremento as Incremento
+                        """
+                    ),
+                    {
+                        "Empresa": p["empresa"],
+                        "OrdemSeparacao": p["separacao_id"],
+                        "ItemSeparacao": peca["item_sep"],
+                        "CodigoBarra": f"{peca['nro_rolo']}{peca['nro_peca']}",
+                        "Qtde": float(peca["quantidade"] or 0),
+                        "ID_Estoque": p["separacao_id"],
+                    },
+                )
+                linha = cursor_erp.fetchone()
+                if linha:
+                    processados += 1
+
+            conn_erp.commit()
+            conn_erp.close()
+
+            # Marcar como processado
+            with warehouse.engine().begin() as conn_sync:
+                conn_sync.execute(
+                    text(
+                        """
+                        update public.wms_coletor_sincronizacao
+                        set status = 'ENVIADO', processado_em = now()
+                        where id = :id
+                        """
+                    ),
+                    {"id": p["id"]},
+                )
+        except Exception as e:
+            erros += 1
+            with warehouse.engine().begin() as conn_sync:
+                conn_sync.execute(
+                    text(
+                        """
+                        update public.wms_coletor_sincronizacao
+                        set tentativas = tentativas + 1,
+                            erro = :erro
+                        where id = :id
+                        """
+                    ),
+                    {"id": p["id"], "erro": str(e)[:500]},
+                )
+
+    return {
+        "ok": True,
+        "processados": processados,
+        "erros": erros,
+    }
+
+
+@router.get("/wms/coletor/dashboard", response_model=ColetorDashboard)
+def coletor_dashboard(usuario: _dependente) -> ColetorDashboard:
+    """Resumo para o coletor: ordens pendentes, em andamento, concluídas hoje."""
+    with warehouse.engine().connect() as conn:
+        pendentes = conn.execute(
+            text(
+                """
+                select count(*)::int
+                from public.wms_separacoes
+                where status = 'LIBERADO'
+                  and arquivada_em is null
+                """
+            )
+        ).scalar_one()
+
+        em_andamento = conn.execute(
+            text(
+                """
+                select count(*)::int
+                from public.wms_separacoes
+                where status = 'EM_SEPARACAO'
+                  and arquivada_em is null
+                """
+            )
+        ).scalar_one()
+
+        concluidas_hoje = conn.execute(
+            text(
+                """
+                select count(*)::int
+                from public.wms_separacoes
+                where status = 'SEPARADO'
+                  and arquivada_em is null
+                  and concluido_em >= current_date
+                """
+            )
+        ).scalar_one()
+
+    return ColetorDashboard(
+        pendentes=pendentes,
+        em_andamento=em_andamento,
+        concluidas_hoje=concluidas_hoje,
+    )
 
 
 __all__ = ["router"]
