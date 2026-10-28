@@ -26,6 +26,7 @@ import re
 import unicodedata
 from typing import Annotated, Any
 
+import pyodbc
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -43,7 +44,24 @@ _dependente = Annotated[Usuario | None, Depends(exigir_escopo(ESCOPO_ESTOQUE))]
 STATUS_LIBERADO = "LIBERADO"
 STATUS_EM_SEPARACAO = "EM_SEPARACAO"
 STATUS_SEPARADO = "SEPARADO"
+
+# --- Credenciais do ERP (mesmas do .env da api-microdata) ---
+ERP_SERVER = "10.156.0.124"
+ERP_DATABASE = "DBMicrodata_DGB"
+ERP_USERNAME = "sadgb"
+ERP_PASSWORD = "P@##saDGB#2025"
+
+ERP_CONN_STR = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    f"SERVER={ERP_SERVER};"
+    f"DATABASE={ERP_DATABASE};"
+    f"UID={ERP_USERNAME};"
+    f"PWD={ERP_PASSWORD};"
+    "TrustServerCertificate=yes;"
+    "Timeout=120;"
+)
 STATUS_CANCELADO = "CANCELADO"
+STATUS_SEM_SEPARACAO = "SEM_SEPARACAO"
 STATUS_ATIVOS = (STATUS_LIBERADO, STATUS_EM_SEPARACAO)
 STATUS_PECA_ATIVA = ("RESERVADA", "SEPARADA")
 LIMITE_MAX = 500
@@ -693,7 +711,6 @@ where p.status = '2'
   and (
       i.qtde - coalesce(i.qtde_romaneio, 0) - coalesce(i.qtde_acerto, 0)
   ) > 0
-  and coalesce(i.liberado, 'S') = 'S'
   {filtros}
 group by
     p.empresa, p.pedido, p.cliente, c.razao_nome_cliente,
@@ -731,7 +748,6 @@ from (
       and (
           i.qtde - coalesce(i.qtde_romaneio, 0) - coalesce(i.qtde_acerto, 0)
       ) > 0
-      and coalesce(i.liberado, 'S') = 'S'
       {filtros}
     group by p.empresa, p.pedido, s.id, s.status, st.codigo
 ) t
@@ -1517,17 +1533,18 @@ def mover_pedido_situacao(
 def arquivar_pedido(
     empresa: str, pedido: str, usuario: _dependente
 ) -> dict[str, Any]:
-    """Tira um pedido cancelado do kanban/lista (situacao local, ERP intacto)."""
+    """Tira um pedido do kanban/lista (situacao local, ERP intacto).
+    Pode ser arquivado em qualquer situação."""
     empresa = (empresa or "").strip()
     pedido = (pedido or "").strip()
     with warehouse.engine().begin() as conn:
         if _pedido_erp(conn, empresa, pedido) is None:
             raise HTTPException(status_code=404, detail="Pedido não encontrado")
         atual = _situacao_atual(conn, empresa, pedido)
-        if atual is None or atual["codigo"] != STATUS_CANCELADO:
+        if atual is None:
             raise HTTPException(
                 status_code=400,
-                detail="Só é possível arquivar pedidos cancelados",
+                detail="Pedido não possui situação no WMS",
             )
         conn.execute(
             text(
@@ -1549,7 +1566,7 @@ def arquivar_pedido(
 def desarquivar_pedido(
     empresa: str, pedido: str, usuario: _dependente
 ) -> dict[str, Any]:
-    """Devolve um pedido arquivado ao kanban/lista."""
+    """Devolve um pedido arquivado ao kanban/lista, na situação Aprovado (SEM_SEPARACAO)."""
     empresa = (empresa or "").strip()
     pedido = (pedido or "").strip()
     with warehouse.engine().begin() as conn:
@@ -1564,6 +1581,15 @@ def desarquivar_pedido(
             raise HTTPException(
                 status_code=404, detail="Pedido não está arquivado"
             )
+        # Devolve para a situação Aprovado (SEM_SEPARACAO)
+        _definir_situacao(
+            conn,
+            empresa,
+            pedido,
+            STATUS_SEM_SEPARACAO,
+            usuario_id=usuario.id if usuario else None,
+            observacao="Devolvido do arquivo para a situação Aprovado",
+        )
         return _pedido(conn, empresa, pedido)
 
 
@@ -2002,7 +2028,7 @@ def arquivar_separacao(
 def desarquivar_separacao(
     separacao_id: int, usuario: _dependente
 ) -> dict[str, Any]:
-    """Devolve uma ordem cancelada arquivada ao kanban/lista."""
+    """Devolve uma ordem cancelada arquivada ao kanban/lista, na situação Liberado."""
     with warehouse.engine().begin() as conn:
         atual = _travar_separacao(conn, separacao_id)
         if atual["arquivada_em"] is None:
@@ -2020,6 +2046,15 @@ def desarquivar_separacao(
                 """
             ),
             {"id": separacao_id},
+        )
+        # Devolve para a situação Liberado
+        _definir_situacao(
+            conn,
+            atual["empresa"],
+            atual["pedido"],
+            STATUS_LIBERADO,
+            usuario_id=usuario.id if usuario else None,
+            observacao="Devolvido do arquivo para a situação Liberado",
         )
         _evento(conn, separacao_id, "DESARQUIVADA")
         return _separacao_por_id(conn, separacao_id)
@@ -2666,6 +2701,255 @@ def kanban_reordenar(
                 },
             )
     return {"ok": True}
+
+
+# ============================================================================
+# Carga de pedidos do ERP para o banco local (dgbcomex_warehouse)
+# ============================================================================
+
+class CargaPedidosEstado(BaseModel):
+    carga_completa: bool
+    contagem: int
+    ultima_data: str | None
+    atualizado_em: str | None
+
+
+class CargaPedidosRequest(BaseModel):
+    forcar: bool = False
+    limite_dias: int | None = None
+
+
+@router.get("/wms/pedidos/carga/estado", response_model=CargaPedidosEstado)
+def carga_pedidos_estado(usuario: _dependente) -> CargaPedidosEstado:
+    """Retorna o estado da última carga de pedidos do ERP para o banco local."""
+    with warehouse.engine().connect() as conn:
+        linha = conn.execute(
+            text("select * from public.wms_get_carga_pedidos_estado()")
+        ).mappings().first()
+    if linha is None:
+        return CargaPedidosEstado(
+            carga_completa=False,
+            contagem=0,
+            ultima_data=None,
+            atualizado_em=None,
+        )
+    return CargaPedidosEstado(
+        carga_completa=bool(linha["carga_completa"]),
+        contagem=int(linha["contagem"] or 0),
+        ultima_data=(
+            linha["ultima_data"].isoformat() if linha["ultima_data"] else None
+        ),
+        atualizado_em=(
+            linha["atualizado_em"].isoformat() if linha["atualizado_em"] else None
+        ),
+    )
+
+
+@router.post("/wms/pedidos/carga", response_model=dict[str, Any])
+def carga_pedidos(
+    dados: CargaPedidosRequest, usuario: _dependente
+) -> dict[str, Any]:
+    """Carrega pedidos aprovados com saldo do ERP para o banco local.
+
+    Carrega apenas pedidos:
+      - com status = '2' (aprovado) no ERP
+      - com status_ped aberto (diferente de 'E')
+      - com saldo > 0 em pelo menos um item
+      - que nao estejam cancelados/enviados no WMS (situacao CANCELADO ou ENVIADO)
+    """
+    estatisticas = {
+        "pedidos_lidos": 0,
+        "pedidos_inseridos": 0,
+        "pedidos_atualizados": 0,
+        "itens_inseridos": 0,
+        "itens_atualizados": 0,
+        "erros": [],
+    }
+
+    try:
+        conn_erp = pyodbc.connect(ERP_CONN_STR)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Falha ao conectar ao ERP: {e}"
+        )
+
+    try:
+        data_corte = None
+        if dados.limite_dias is not None:
+            from datetime import datetime, timedelta
+
+            data_corte = (
+                datetime.now() - timedelta(days=dados.limite_dias)
+            ).strftime("%Y-%m-%d")
+
+        cursor = conn_erp.cursor()
+        where = "p.status = '2'"
+        params: list[Any] = []
+        if data_corte:
+            where += " and p.data_pedido >= ?"
+            params.append(data_corte)
+
+        cols_pedido = [
+            "empresa", "pedido", "cliente", "data_pedido", "cond_pagto",
+            "data_entrega", "cod_transp", "des_transp", "cod_redesp", "des_redesp",
+            "end1_redesp", "end2_redesp", "porc_desc", "porc_acresc", "seu_pedido",
+            "contato", "classificacao", "status", "banco_1", "agencia_1", "dig_age_1",
+            "conta_1", "dig_con_1", "operacao_1", "banco_2", "agencia_2", "dig_age_2",
+            "conta_2", "dig_con_2", "operacao_2", "cobranca_1", "cobranca_2",
+            "cheque_1", "cheque_2", "pagto_1", "pagto_2", "ver_obs_1", "ver_obs_2",
+            "frete_conta", "tipo_pedido", "cond_pagto_extenso", "via", "s_pro",
+            "s_sit", "s_cor", "s_des", "s_cat", "end1_cobranca", "end2_cobranca",
+            "end1_entrega", "end2_entrega", "redespacho_conta", "usuario", "vr_frete",
+            "usuario_alt", "remessa", "datas_entrega", "pecas", "datas_entrega2",
+            "porcentagem_comissao", "usa_enfestado_rolo", "local_entrega",
+            "status_email", "politica", "s_larg", "tabela_tinturaria", "prazo_medio",
+            "pedido_urgente", "aceita_pedido_parcial", "bloqueado",
+            "cliente_triangulo", "tipo_comercializacao", "s_variante",
+            "motivo_reprova", "status_ped", "entregas_futuras",
+            "modalidade_ent_princ", "modalidade_ent_detal", "pedido_representante",
+            "cod_tabela_preco_def_usuario", "dt_ultima_aprov_comerc",
+            "tipo_pedido_comercial", "validado_gestor", "data_hora_alteracao",
+            "descricao_reprova", "cliente_entrega", "perc_rentabilidade_geral",
+            "linha_produto", "pedido_ecommerce", "alerta_cd", "tp_orig_ped_cd",
+            "motivo_alt_cd", "cond_cd", "usu_cd", "ped_orig_nu", "email_enviado",
+            "marcacao_cd", "pedido_id", "regra_negocio",
+        ]
+        cols_item = [
+            "empresa", "pedido", "item", "produto", "situacao", "cor", "desenho",
+            "categoria", "qtde", "vr_unitario", "vr_unitario2", "vr_total",
+            "classificacao", "data_entrega", "observacao", "qtde_romaneio",
+            "qtde_acerto", "largura", "comissao", "data_acerto", "usuario_acerto",
+            "comissao_s", "tipo", "usuario", "produto_cliente", "unid", "unid_fat",
+            "qtde_fat", "vr_unitario_fat", "exclusivo", "distrib_metros_in",
+            "distrib_metros_fn", "variante", "status_item", "vr_unit_servico",
+            "vr_unit_prod_aplicado", "tipo_fornec", "fornecedor", "indice1",
+            "indice2", "indice3", "vr_desconto", "porc_desconto", "obs_web",
+            "item_ped_compra", "dif_perc_tabela_preco", "aprovado_comercial",
+            "dt_ver_aprov_com", "val_tabela_preco", "val_tabela_preco_total",
+            "dif_val_tabela_preco", "perc_comissao", "val_frete", "cod_tab_preco",
+            "tamanho_min_peca", "comissao_original", "comissaos_original",
+            "comissao_manual", "perc_min_aprovacao", "dt_entrega", "liberado",
+            "grupo_item", "data_previsao_fabril", "val_tab_desc_comercial",
+            "peso_padrao", "nro_unidades", "perc_rentabilidade",
+            "aprovado_comercial_rentabilidade", "motivo_reprova_rentabilidade",
+            "perc_impostos", "custo_produto", "preco_err", "desc_porc",
+            "categ_err", "prod_tam", "preco_orig", "acres_porc",
+            "prod_bonif_err", "cond_pgto_parc_cd", "cond_pgto_cd", "estoque_dt",
+            "estoque_existe", "estoque_ped_nu", "estoque_item_nu",
+        ]
+
+        sql_pedidos = f"""
+            select {", ".join(cols_pedido)}
+            from car_pedido p
+            where {where}
+              and not exists (
+                  select 1 from public.wms_pedidos_arquivados arq
+                  where arq.empresa = p.empresa and arq.pedido = p.pedido
+              )
+            order by p.data_pedido desc
+        """
+        cursor = conn_erp.cursor()
+        cursor.execute(sql_pedidos, params)
+        colunas_erp = [desc[0] for desc in cursor.description]
+
+        pedidos_erp: list[dict[str, Any]] = []
+        for row in cursor.fetchall():
+            estatisticas["pedidos_lidos"] += 1
+            linha = dict(zip(colunas_erp, row))
+            pedidos_erp.append({c: linha.get(c) for c in cols_pedido})
+
+        agora = datetime.now()
+
+        with warehouse.engine().begin() as conn_local:
+            for p in pedidos_erp:
+                cols_sql = ", ".join(cols_pedido + ["_carga_em"])
+                placeholders = (
+                    ", ".join(f":{c}" for c in cols_pedido) + ", :_carga_em"
+                )
+                update_clause = (
+                    ", ".join(f"{c} = excluded.{c}" for c in cols_pedido)
+                    + ", _carga_em = excluded._carga_em"
+                )
+                sql = f"""
+                    insert into raw.car_pedido ({cols_sql})
+                    values ({placeholders})
+                    on conflict (empresa, pedido) do update
+                    set {update_clause}
+                """
+                params_sql = {c: p[c] for c in cols_pedido}
+                params_sql["_carga_em"] = agora
+                resultado = conn_local.execute(text(sql), params_sql)
+                if resultado.rowcount == 1:
+                    estatisticas["pedidos_inseridos"] += 1
+                else:
+                    estatisticas["pedidos_atualizados"] += 1
+
+                # Carregar itens do pedido
+                sql_itens = f"""
+                    select {", ".join(cols_item)}
+                    from car_itens_pedido
+                    where empresa = ? and pedido = ?
+                """
+                cursor_itens = conn_erp.cursor()
+                cursor_itens.execute(sql_itens, [p["empresa"], p["pedido"]])
+                colunas_itens = [desc[0] for desc in cursor_itens.description]
+
+                for row_item in cursor_itens.fetchall():
+                    linha_item = dict(zip(colunas_itens, row_item))
+                    item = {c: linha_item.get(c) for c in cols_item}
+
+                    cols_i_sql = ", ".join(cols_item + ["_carga_em"])
+                    placeholders_i = (
+                        ", ".join(f":{c}" for c in cols_item) + ", :_carga_em"
+                    )
+                    update_i_clause = (
+                        ", ".join(f"{c} = excluded.{c}" for c in cols_item)
+                        + ", _carga_em = excluded._carga_em"
+                    )
+                    sql_i = f"""
+                        insert into raw.car_itens_pedido ({cols_i_sql})
+                        values ({placeholders_i})
+                        on conflict (empresa, pedido, item) do update
+                        set {update_i_clause}
+                    """
+                    params_i = {c: item[c] for c in cols_item}
+                    params_i["_carga_em"] = agora
+                    resultado_i = conn_local.execute(text(sql_i), params_i)
+                    if resultado_i.rowcount == 1:
+                        estatisticas["itens_inseridos"] += 1
+                    else:
+                        estatisticas["itens_atualizados"] += 1
+
+        # Atualizar estado da carga
+        conn_local_exec = warehouse.engine()
+        with conn_local_exec.begin() as conn_estado:
+            conn_estado.execute(
+                text(
+                    """
+                    select public.wms_set_carga_pedidos_estado(
+                        :carga_completa, :contagem, :ultima_data
+                    )
+                    """
+                ),
+                {
+                    "carga_completa": True,
+                    "contagem": estatisticas["pedidos_inseridos"]
+                    + estatisticas["pedidos_atualizados"],
+                    "ultima_data": agora,
+                },
+            )
+
+        estatisticas["ok"] = True
+        return estatisticas
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Falha na carga de pedidos: {e}"
+        )
+    finally:
+        conn_erp.close()
 
 
 __all__ = ["router"]

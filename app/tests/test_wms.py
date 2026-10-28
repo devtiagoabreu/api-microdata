@@ -500,20 +500,19 @@ class TestArquivamento:
         )
         assert desarquivar.status_code == 200, desarquivar.text
         assert desarquivar.json()["arquivado"] is False
-        # Pedido desarquivado mas ainda cancelado não aparece na lista normal
-        normal = self._listar_pedidos(cenario, arquivados=False)
-        assert all(item["pedido"] != cenario["pedido"] for item in normal)
-        # Ao mover para Liberado, volta a aparecer
-        resp = _mover(cenario, "LIBERADO")
-        assert resp.status_code == 200, resp.text
+        # Pedido desarquivado volta para a situação Aprovado (SEM_SEPARACAO)
+        # ou FATURADO se todos os itens já estão faturados (sobrescrita automática)
         normal = self._listar_pedidos(cenario, arquivados=False)
         assert any(item["pedido"] == cenario["pedido"] for item in normal)
+        item = [i for i in normal if i["pedido"] == cenario["pedido"]][0]
+        assert item["separacaoStatus"] in ("SEM_SEPARACAO", "FATURADO")
 
-    def test_arquivar_pedido_nao_cancelado_da_400(self, cenario):
+    def test_arquivar_pedido_em_qualquer_situacao(self, cenario):
+        # Pode arquivar pedido em qualquer situação (não apenas cancelado)
         assert _mover(cenario, "LIBERADO").status_code == 200
         resposta = self._arquivar_pedido(cenario)
-        assert resposta.status_code == 400
-        assert "cancelados" in resposta.json()["detail"]
+        assert resposta.status_code == 200, resposta.text
+        assert resposta.json()["arquivado"] is True
 
     def test_mover_pedido_arquivado_desarquiva(self, cenario):
         assert _mover(cenario, "CANCELADO").status_code == 200
