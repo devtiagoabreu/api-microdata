@@ -286,6 +286,19 @@ class TestPedidos:
         resposta = client.get("/wms/pedidos/13/INEXISTENTE")
         assert resposta.status_code == 404
 
+    def test_estado_da_carga_nao_vira_detalhe_de_pedido(self):
+        """`/wms/pedidos/carga/estado` e caminho fixo: nao pode cair na rota do pedido.
+
+        Com `/wms/pedidos/{empresa}/{pedido}` declarada antes, o FastAPI lia
+        "carga" como empresa e "estado" como pedido e devolvia 404 "Pedido nao
+        encontrado" — a tela do WMS ficava sem o estado da carga.
+        """
+        resposta = client.get("/wms/pedidos/carga/estado")
+        assert resposta.status_code == 200
+        assert "Pedido não encontrado" not in resposta.text
+        corpo = resposta.json()
+        assert "cargaCompleta" in corpo or "carga_completa" in corpo
+
 
 class TestKanbanOrdem:
     def test_salvar_e_ler_ordem_dos_pedidos(self):

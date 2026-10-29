@@ -1089,6 +1089,48 @@ def _pedido(conn: Any, empresa: str, pedido: str) -> dict[str, Any]:
     }
 
 
+class CargaPedidosEstado(BaseModel):
+    carga_completa: bool
+    contagem: int
+    ultima_data: str | None
+    atualizado_em: str | None
+
+
+class CargaPedidosRequest(BaseModel):
+    forcar: bool = False
+    limite_dias: int | None = None
+
+
+# Esta rota precisa ser declarada ANTES de `/wms/pedidos/{empresa}/{pedido}`.
+# O FastAPI casa as rotas na ordem em que foram declaradas: com a rota dos pedidos
+# na frente, "carga/estado" era lido como empresa="carga", pedido="estado" e a
+# tela recebia 404 "Pedido não encontrado" em vez do estado da carga.
+@router.get("/wms/pedidos/carga/estado", response_model=CargaPedidosEstado)
+def carga_pedidos_estado(usuario: _dependente) -> CargaPedidosEstado:
+    """Retorna o estado da última carga de pedidos do ERP para o banco local."""
+    with warehouse.engine().connect() as conn:
+        linha = conn.execute(
+            text("select * from public.wms_get_carga_pedidos_estado()")
+        ).mappings().first()
+    if linha is None:
+        return CargaPedidosEstado(
+            carga_completa=False,
+            contagem=0,
+            ultima_data=None,
+            atualizado_em=None,
+        )
+    return CargaPedidosEstado(
+        carga_completa=bool(linha["carga_completa"]),
+        contagem=int(linha["contagem"] or 0),
+        ultima_data=(
+            linha["ultima_data"].isoformat() if linha["ultima_data"] else None
+        ),
+        atualizado_em=(
+            linha["atualizado_em"].isoformat() if linha["atualizado_em"] else None
+        ),
+    )
+
+
 @router.get("/wms/pedidos/{empresa}/{pedido}")
 def detalhe_pedido(empresa: str, pedido: str, usuario: _dependente) -> dict[str, Any]:
     """Pedido com itens, saldo e o que ja esta reservado/separado no WMS."""
@@ -2706,44 +2748,6 @@ def kanban_reordenar(
 # ============================================================================
 # Carga de pedidos do ERP para o banco local (dgbcomex_warehouse)
 # ============================================================================
-
-class CargaPedidosEstado(BaseModel):
-    carga_completa: bool
-    contagem: int
-    ultima_data: str | None
-    atualizado_em: str | None
-
-
-class CargaPedidosRequest(BaseModel):
-    forcar: bool = False
-    limite_dias: int | None = None
-
-
-@router.get("/wms/pedidos/carga/estado", response_model=CargaPedidosEstado)
-def carga_pedidos_estado(usuario: _dependente) -> CargaPedidosEstado:
-    """Retorna o estado da última carga de pedidos do ERP para o banco local."""
-    with warehouse.engine().connect() as conn:
-        linha = conn.execute(
-            text("select * from public.wms_get_carga_pedidos_estado()")
-        ).mappings().first()
-    if linha is None:
-        return CargaPedidosEstado(
-            carga_completa=False,
-            contagem=0,
-            ultima_data=None,
-            atualizado_em=None,
-        )
-    return CargaPedidosEstado(
-        carga_completa=bool(linha["carga_completa"]),
-        contagem=int(linha["contagem"] or 0),
-        ultima_data=(
-            linha["ultima_data"].isoformat() if linha["ultima_data"] else None
-        ),
-        atualizado_em=(
-            linha["atualizado_em"].isoformat() if linha["atualizado_em"] else None
-        ),
-    )
-
 
 @router.post("/wms/pedidos/carga", response_model=dict[str, Any])
 def carga_pedidos(
