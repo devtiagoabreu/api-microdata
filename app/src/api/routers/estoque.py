@@ -338,7 +338,7 @@ def dados_real_time(
         (a.Nro_Rolo + a.Situacao + a.Cor + a.Desenho) as Chave,
         a.Num_Etq_Aux,
         pt.linha as Linha
-    from DBProDash.dbo.Cte_Peca a
+    from DBProDash.dbo.CTE_Peca a
     left join DBProDash.dbo.Produtos_Tecidos pt
         on pt.empresa = a.emp_prod
        and pt.produto = a.produto
@@ -350,7 +350,6 @@ def dados_real_time(
           and b.nro_peca = a.nro_peca
     )
     and a.nro_rolo_origem is null
-    {" ".join(condicoes)}
     order by
         a.sub_lote asc,
         a.tear asc,
@@ -362,14 +361,21 @@ def dados_real_time(
         a.categoria_tinto asc,
         a.empresa asc,
         a.nro_peca asc
-    limit :limite offset :offset
+    offset ? rows fetch next ? rows only
     """
-    rows = erp.query(sql, params)
+    rows = erp.query(sql, (offset, limite))
     saida = []
     for linha in rows:
         peca = _normalizar_legado({mapa: linha[mapa] for mapa in COLUNAS_LEGADO})
         saida.append(peca)
     return saida
+
+
+def _pagina_sql(limite: int, offset: int) -> str:
+    """SQL Server usa TOP em vez de LIMIT/OFFSET.
+    A paginação é feita aplicando OFFSET ... FETCH após um TOP inicial.
+    """
+    return f"TOP ({limite}) OFFSET {offset} ROWS"
 
 
 def _texto(valor: Any) -> str:
