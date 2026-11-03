@@ -5,8 +5,8 @@ O legado fazia `fetchall` de ~300 mil peças por request e chamava a procedure
 de views do warehouse local — `/dados` usa cursor com filtros e paginação, e a sugestão
 reproduz a mesma regra número a número (validada em `scripts.validar_fase_d sugestao_rolos`).
 
-/dados-real-time: mesma estrutura do legado mas lida do ERP ao vivo (DBProDash.dbo.Cte_Peca),
-servindofronts que precisam de dados frescos e nâo podem depender do warehouse atrasado.
+/dados-real-time: mesma estrutura do legado mas lida do ERP ao vivo (dbo.Cte_Peca), servindo
+fronts que precisam de dados frescos e não podem depender do warehouse atrasado.
 """
 
 from __future__ import annotations
@@ -301,57 +301,78 @@ def dados_real_time(
     limite: int = Query(10_000, ge=1, le=100_000),
     offset: int = Query(0, ge=0),
 ) -> list[dict[str, Any]]:
-    """`/dados-legado` no **formato legado** mas lido **ao vivo do ERP** (DBProDash.dbo.Cte_Peca).
+    """`/dados-legado` no **formato legado** mas lido **ao vivo do ERP** (`dbo.Cte_Peca`).
 
-    Mesmo contrato de colunas, ordem e `Chave` do `/dados-legado`, porém a query usa a tabela
-    do ERP ao invés do warehouse local postponado. Serve para fronts que precisam de dados
-    frescos no momento do request e nâo podem aceitar o atraso do ETL do warehouse.
+    Mesmo contrato de colunas, ordem e `Chave` do `/dados-legado`, porém a query vai direto no
+    SQL Server (`DBMicrodata_DGB.dbo.Cte_Peca` + `CTE_Baixa` + `Produtos_Tecidos`), igual ao
+    oraculum legado — sem depender do warehouse local, que só é atualizado pelo ETL.
 
-    O corte por empresa (D6) é aplicado idêntico às outras rotas.
+    A view `DBProDash.dbo.VW_CTE_PECA_EM_ABERTO` **não** serve aqui: expõe só 19 colunas e não
+    tem `Lote_Interno`, `Aviso`, `SubLote`, `Largura`, `Tear`, `Num_Etq_Aux` nem
+    `Categoria_Tinto`, que o contrato legado exige. O corte por empresa (D6) é o mesmo das
+    outras rotas; a paginação usa `OFFSET`/`FETCH` (SQL Server não tem `LIMIT`). `limite` e
+    `offset` (inteiros validados pelo FastAPI) entram inline para não depender de placeholder
+    no `FETCH`.
     """
     condicoes: list[str] = []
-    params: dict[str, Any] = {"limite": limite, "offset": offset}
+    params: list[Any] = []
     empresa_do_token = empresa_efetiva(usuario, empresa)
     if empresa_do_token:
-        condicoes.append("and empresa = :empresa")
-        params["empresa"] = empresa_do_token
-sql = """
-    select top ? *
-    from DBProDash.dbo.VW_CTE_PECA_EM_ABERTO a
-    where not exists (
-        select 1
-        from DBProDash.dbo.CTE_Baixa b
-        where b.empresa = a.empresa
-          and b.nro_rolo = a.nro_rolo
-          and b.nro_peca = a.nro_peca
-    )
-    and a.nro_rolo_origem is null
+        condicoes.append("and cp.empresa = ?")
+        params.append(empresa_do_token)
+    sql = f"""
+    select
+        cp.lote_interno                                   as "Lote_Interno",
+        cp.aviso                                          as "Aviso",
+        cp.gaveta                                         as "Gaveta",
+        cp.sublote                                        as "SubLote",
+        cp.situacao                                       as "Situacao",
+        cp.nro_rolo                                       as "Nro_Rolo",
+        cp.nro_peca                                       as "Nro_Peca",
+        cp.produto                                        as "Produto",
+        cp.categoria                                      as "Categoria",
+        cp.categoria_tinto                                as "Categoria_Tinto",
+        cp.cor                                            as "Cor",
+        cp.desenho                                        as "Desenho",
+        cp.variante                                       as "Variante",
+        cp.largura                                        as "Largura",
+        cast(cp.metros as decimal(18, 2))                 as "Metros",
+        cast(cp.peso as decimal(18, 2))                   as "Peso",
+        cp.tear                                           as "Rolo_Packlist",
+        cp.data_entrada                                   as "Data_Entrada",
+        (cp.nro_rolo + cp.situacao + cp.cor + cp.desenho) as "Chave",
+        cp.num_etq_aux                                    as "Num_Etq_Aux",
+        pt.linha                                          as "Linha"
+    from dbo.cte_peca cp
+    left join dbo.cte_baixa cb
+        on cp.empresa = cb.empresa
+       and cp.situacao = cb.situacao
+       and cp.nro_rolo = cb.nro_rolo
+       and cp.nro_peca = cb.nro_peca
+    left join dbo.produtos_tecidos pt
+        on cp.empprod = pt.empresa
+       and cp.produto = pt.produto
+    where cp.nro_rolo_origem is null
+      and cb.empresa is null
+      {" ".join(condicoes)}
     order by
-        a.sub_lote asc,
-        a.tear asc,
-        a.gaveta asc,
-        a.produto asc,
-        a.cor asc,
-        a.aviso desc,
-        a.nro_rolo desc,
-        a.categoria_tinto asc,
-        a.empresa asc,
-        a.nro_peca asc
-    offset ? rows fetch next ? rows only
+        cp.sublote asc,
+        cp.tear asc,
+        cp.gaveta asc,
+        cp.produto asc,
+        cp.cor asc,
+        cp.aviso desc,
+        cp.nro_rolo desc,
+        cp.categoria_tinto asc,
+        cp.empresa asc,
+        cp.nro_peca asc
+    offset {offset} rows fetch next {limite} rows only
     """
-    rows = erp.query(sql, (limite, offset, limite))
-    saida = []
-    for linha in rows:
-        peca = _normalizar_legado({mapa: linha[mapa] for mapa in COLUNAS_LEGADO})
-        saida.append(peca)
-    return saida
-
-
-def _pagina_sql(limite: int, offset: int) -> str:
-    """SQL Server usa TOP em vez de LIMIT/OFFSET.
-    A paginação é feita aplicando OFFSET ... FETCH após um TOP inicial.
-    """
-    return f"TOP ({limite}) OFFSET {offset} ROWS"
+    rows = erp.query(sql, tuple(params))
+    return [
+        _normalizar_legado({mapa: linha[mapa] for mapa in COLUNAS_LEGADO})
+        for linha in rows
+    ]
 
 
 def _texto(valor: Any) -> str:
