@@ -315,36 +315,12 @@ def dados_real_time(
     if empresa_do_token:
         condicoes.append("and empresa = :empresa")
         params["empresa"] = empresa_do_token
-    sql = """
-    select
-        a.Lote_Interno,
-        a.Aviso,
-        a.Gaveta,
-        a.SubLote,
-        a.Situacao,
-        a.Nro_Rolo,
-        a.Nro_Peca,
-        a.Produto,
-        a.Categoria,
-        a.Categoria_Tinto,
-        a.Cor,
-        a.Desenho,
-        a.Variante,
-        cast(a.Largura as varchar(20)) as Largura,
-        cast(a.Metros as decimal(18, 2)) as Metros,
-        cast(a.Peso as decimal(18, 2)) as Peso,
-        a.Rolo_Packlist,
-        a.Data_Entrada,
-        (a.Nro_Rolo + a.Situacao + a.Cor + a.Desenho) as Chave,
-        a.Num_Etq_Aux,
-        pt.linha as Linha
-    from DBProDash.dbo.CTE_Peca a
-    left join DBProDash.dbo.Produtos_Tecidos pt
-        on pt.empresa = a.emp_prod
-       and pt.produto = a.produto
+sql = """
+    select top ? *
+    from DBProDash.dbo.VW_CTE_PECA_EM_ABERTO a
     where not exists (
         select 1
-        from DBProDash.dbo.Cte_Baixa b
+        from DBProDash.dbo.CTE_Baixa b
         where b.empresa = a.empresa
           and b.nro_rolo = a.nro_rolo
           and b.nro_peca = a.nro_peca
@@ -363,7 +339,7 @@ def dados_real_time(
         a.nro_peca asc
     offset ? rows fetch next ? rows only
     """
-    rows = erp.query(sql, (offset, limite))
+    rows = erp.query(sql, (limite, offset, limite))
     saida = []
     for linha in rows:
         peca = _normalizar_legado({mapa: linha[mapa] for mapa in COLUNAS_LEGADO})
