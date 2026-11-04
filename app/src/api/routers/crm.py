@@ -167,7 +167,7 @@ def _linha_pedido(linha: dict[str, Any]) -> dict[str, Any]:
         "condicao_pagamento": _texto(linha.get("cond_pagto")),
         "representante": _texto(linha.get("pedido_representante")),
         "identificador_erp": _texto(linha.get("pedido_id")),
-        "itens": int(linha.get("itens") or 0),
+        "total_itens": int(linha.get("itens") or 0),
         "quantidade": _numero(linha.get("quantidade")),
         "valor_total": _numero(linha.get("valor_total")),
     }
@@ -262,7 +262,7 @@ def detalhe_pedido(
             ).mappings()
         ]
     documento = _linha_pedido(dict(cabecalho))
-    documento["itens"] = len(itens)
+    documento["total_itens"] = len(itens)
     documento["quantidade"] = sum(item["quantidade"] for item in itens)
     documento["valor_total"] = sum(item["valor_total"] for item in itens)
     return {**documento, "itens": itens}
@@ -321,7 +321,7 @@ def _linha_faturamento(linha: dict[str, Any]) -> dict[str, Any]:
         "status": _texto(linha.get("status_gravado")),
         "condicao_pagamento": _texto(linha.get("cond_pagto_extenso")),
         "valor_nota": _numero(linha.get("vr_nota")),
-        "itens": int(linha.get("itens") or 0),
+        "total_itens": int(linha.get("itens") or 0),
         "quantidade": _numero(linha.get("quantidade")),
         "valor_total": _numero(linha.get("valor_total")),
     }
@@ -419,7 +419,7 @@ def detalhe_faturamento(
             ).mappings()
         ]
     documento = _linha_faturamento(dict(cabecalho))
-    documento["itens"] = len(itens)
+    documento["total_itens"] = len(itens)
     documento["quantidade"] = sum(item["quantidade"] for item in itens)
     documento["valor_total"] = sum(
         item["valor_total"] + item["acrescimo_desconto"] for item in itens

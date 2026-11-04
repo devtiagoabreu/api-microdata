@@ -197,6 +197,7 @@ class TestPedidos:
         assert item["data_pedido"] == "2026-10-30"
         assert item["valor_total"] == 5200.0
         assert item["quantidade"] == 100.0
+        assert item["total_itens"] == 2
 
     def test_filtro_de_cnpj_compara_apenas_digitos(self, monkeypatch, sem_auth):
         engine = _ligar(monkeypatch, {"count(*)": [{"total": 0}]})
