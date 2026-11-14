@@ -2778,12 +2778,16 @@ def carga_pedidos(
         ) from e
 
     try:
+        from datetime import datetime, timedelta
+
         data_corte = None
         if dados.limite_dias is not None:
-            from datetime import datetime, timedelta
-
             data_corte = (
                 datetime.now() - timedelta(days=dados.limite_dias)
+            ).strftime("%Y-%m-%d")
+        elif not dados.forcar:
+            data_corte = (
+                datetime.now() - timedelta(days=30)
             ).strftime("%Y-%m-%d")
 
         cursor = conn_erp.cursor()
@@ -2797,24 +2801,23 @@ def carga_pedidos(
             "empresa", "pedido", "cliente", "data_pedido", "cond_pagto",
             "data_entrega", "cod_transp", "des_transp", "cod_redesp", "des_redesp",
             "end1_redesp", "end2_redesp", "porc_desc", "porc_acresc", "seu_pedido",
-            "contato", "classificacao", "status", "banco_1", "agencia_1", "dig_age_1",
-            "conta_1", "dig_con_1", "operacao_1", "banco_2", "agencia_2", "dig_age_2",
-            "conta_2", "dig_con_2", "operacao_2", "cobranca_1", "cobranca_2",
-            "cheque_1", "cheque_2", "pagto_1", "pagto_2", "ver_obs_1", "ver_obs_2",
-            "frete_conta", "tipo_pedido", "cond_pagto_extenso", "via", "s_pro",
-            "s_sit", "s_cor", "s_des", "s_cat", "end1_cobranca", "end2_cobranca",
+            "contato", "classificacao", "status", "banco_1", "agencia_1",
+            "conta_1", "operacao_1", "banco_2", "agencia_2",
+            "conta_2", "operacao_2", "cobranca_1", "cobranca_2",
+            "cheque_1", "cheque_2", "pagto_1", "pagto_2",
+            "frete_conta", "tipo_pedido", "cond_pagto_extenso", "via",
+            "end1_cobranca", "end2_cobranca",
             "end1_entrega", "end2_entrega", "redespacho_conta", "usuario", "vr_frete",
             "usuario_alt", "remessa", "datas_entrega", "pecas", "datas_entrega2",
             "porcentagem_comissao", "usa_enfestado_rolo", "local_entrega",
-            "status_email", "politica", "s_larg", "tabela_tinturaria", "prazo_medio",
+            "status_email", "politica", "tabela_tinturaria", "prazo_medio",
             "pedido_urgente", "aceita_pedido_parcial", "bloqueado",
-            "cliente_triangulo", "tipo_comercializacao", "s_variante",
-            "motivo_reprova", "status_ped", "entregas_futuras",
+            "cliente_triangulo", "tipo_comercializacao",
+            "status_ped", "entregas_futuras",
             "modalidade_ent_princ", "modalidade_ent_detal", "pedido_representante",
             "cod_tabela_preco_def_usuario", "dt_ultima_aprov_comerc",
-            "tipo_pedido_comercial", "validado_gestor", "data_hora_alteracao",
-            "descricao_reprova", "cliente_entrega", "perc_rentabilidade_geral",
-            "linha_produto", "pedido_ecommerce", "alerta_cd", "tp_orig_ped_cd",
+            "tipo_pedido_comercial", "validado_gestor",
+            "pedido_ecommerce", "alerta_cd", "tp_orig_ped_cd",
             "motivo_alt_cd", "cond_cd", "usu_cd", "ped_orig_nu", "email_enviado",
             "marcacao_cd", "pedido_id", "regra_negocio",
         ]
@@ -2823,20 +2826,17 @@ def carga_pedidos(
             "categoria", "qtde", "vr_unitario", "vr_unitario2", "vr_total",
             "classificacao", "data_entrega", "observacao", "qtde_romaneio",
             "qtde_acerto", "largura", "comissao", "data_acerto", "usuario_acerto",
-            "comissao_s", "tipo", "usuario", "produto_cliente", "unid", "unid_fat",
-            "qtde_fat", "vr_unitario_fat", "exclusivo", "distrib_metros_in",
-            "distrib_metros_fn", "variante", "status_item", "vr_unit_servico",
+            "tipo", "usuario", "produto_cliente", "unid", "unid_fat",
+            "qtde_fat", "vr_unitario_fat", "exclusivo", "variante", "status_item", "vr_unit_servico",
             "vr_unit_prod_aplicado", "tipo_fornec", "fornecedor", "indice1",
             "indice2", "indice3", "vr_desconto", "porc_desconto", "obs_web",
             "item_ped_compra", "dif_perc_tabela_preco", "aprovado_comercial",
             "dt_ver_aprov_com", "val_tabela_preco", "val_tabela_preco_total",
             "dif_val_tabela_preco", "perc_comissao", "val_frete", "cod_tab_preco",
             "tamanho_min_peca", "comissao_original", "comissaos_original",
-            "comissao_manual", "perc_min_aprovacao", "dt_entrega", "liberado",
+            "comissao_manual", "perc_min_aprovacao", "liberado",
             "grupo_item", "data_previsao_fabril", "val_tab_desc_comercial",
-            "peso_padrao", "nro_unidades", "perc_rentabilidade",
-            "aprovado_comercial_rentabilidade", "motivo_reprova_rentabilidade",
-            "perc_impostos", "custo_produto", "preco_err", "desc_porc",
+            "peso_padrao", "nro_unidades", "preco_err", "desc_porc",
             "categ_err", "prod_tam", "preco_orig", "acres_porc",
             "prod_bonif_err", "cond_pgto_parc_cd", "cond_pgto_cd", "estoque_dt",
             "estoque_existe", "estoque_ped_nu", "estoque_item_nu",
@@ -2846,12 +2846,19 @@ def carga_pedidos(
             select {", ".join(cols_pedido)}
             from car_pedido p
             where {where}
-              and not exists (
-                  select 1 from public.wms_pedidos_arquivados arq
-                  where arq.empresa = p.empresa and arq.pedido = p.pedido
-              )
             order by p.data_pedido desc
         """
+
+        # Pedidos arquivados no WMS (warehouse, PostgreSQL) — nao podem ser
+        # consultados no ERP (SQL Server), entao buscamos a lista aqui e
+        # descartamos em Python antes de gravar.
+        arquivados: set[tuple[str, str]] = set()
+        with warehouse.engine().connect() as conn_arq:
+            for row in conn_arq.execute(
+                text("select empresa, pedido from public.wms_pedidos_arquivados")
+            ).fetchall():
+                arquivados.add((str(row[0]), str(row[1])))
+
         cursor = conn_erp.cursor()
         cursor.execute(sql_pedidos, params)
         colunas_erp = [desc[0] for desc in cursor.description]
@@ -2860,7 +2867,10 @@ def carga_pedidos(
         for row in cursor.fetchall():
             estatisticas["pedidos_lidos"] += 1
             linha = dict(zip(colunas_erp, row, strict=True))
-            pedidos_erp.append({c: linha.get(c) for c in cols_pedido})
+            pedido = {c: linha.get(c) for c in cols_pedido}
+            if (str(pedido.get("empresa")), str(pedido.get("pedido"))) in arquivados:
+                continue
+            pedidos_erp.append(pedido)
 
         agora = datetime.now()
 

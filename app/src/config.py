@@ -45,6 +45,9 @@ class Settings(BaseSettings):
 
     neon_publicar_automatico: bool = False
 
+    gmail_user: str = ""
+    gmail_app_password: str = ""
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:
