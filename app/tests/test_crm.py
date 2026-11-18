@@ -8,7 +8,7 @@ empresa) que o CRM consome.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import pytest
@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from src.api.auth.usuarios import Usuario
 from src.api.main import app
 from src.api.routers import crm
+from src.etl import delta_erp
 
 client = TestClient(app)
 
@@ -164,8 +165,10 @@ class TestContrato:
         rotas = set(app.openapi()["paths"])
         for rota in (
             "/crm/pedidos",
+            "/crm/pedidos/sincronizar",
             "/crm/pedidos/{empresa}/{pedido}",
             "/crm/faturamentos",
+            "/crm/faturamentos/sincronizar",
             "/crm/faturamentos/{empresa}/{pedido}/{nr_nota}",
         ):
             assert rota in rotas, rota
@@ -206,6 +209,36 @@ class TestPedidos:
         assert "regexp_replace(p.cliente" in sql
         params = [p for p in engine.conn.params if "cnpj" in p]
         assert params and params[0]["cnpj"] == "61174572000181"
+
+    def test_nao_traz_cancelados_nem_pedidos_ja_faturados(self, monkeypatch, sem_auth):
+        engine = _ligar(monkeypatch, {"count(*)": [{"total": 0}]})
+        client.get("/crm/pedidos")
+        sql = " ".join(engine.conn.sqls)
+        assert "p.status is null or p.status <> '3'" in sql
+        assert "raw.fat_pedido f" in sql
+        assert "f.nosso_pedido = p.pedido" in sql
+
+    def test_sincronizacao_diferencial_de_pedidos(self, monkeypatch, sem_auth):
+        resultado = {"desde": "2026-11-16T00:00:00", "documentos": 1, "itens": 3}
+        chamadas: list[int] = []
+
+        def fake() -> dict[str, Any]:
+            chamadas.append(1)
+            return resultado
+
+        monkeypatch.setattr(crm.delta_erp, "sincronizar_pedidos", fake)
+        resposta = client.post("/crm/pedidos/sincronizar")
+        assert resposta.status_code == 200
+        assert resposta.json() == resultado
+        assert chamadas == [1]
+
+    def test_sql_de_carga_respeita_data_e_exclusoes(self):
+        desde = datetime(2026, 11, 16)
+        sql, params = delta_erp._sql_pedidos(["Empresa", "Pedido"], desde)
+        assert "p.[Data_Pedido] >= ?" in sql
+        assert params == [desde]
+        assert "p.[Status] <> '3'" in sql
+        assert "f.[Nosso_Pedido] = p.[Pedido]" in sql
 
     def test_busca_cobre_pedido_e_nome_do_cliente(self, monkeypatch, sem_auth):
         engine = _ligar(monkeypatch, {"count(*)": [{"total": 0}]})
@@ -258,6 +291,20 @@ class TestPedidos:
 
 
 class TestFaturamentos:
+    def test_sincronizacao_diferencial_de_faturamentos(self, monkeypatch, sem_auth):
+        resultado = {"desde": "2026-11-16T00:00:00", "documentos": 2, "itens": 4}
+        chamadas: list[int] = []
+
+        def fake() -> dict[str, Any]:
+            chamadas.append(1)
+            return resultado
+
+        monkeypatch.setattr(crm.delta_erp, "sincronizar_faturamentos", fake)
+        resposta = client.post("/crm/faturamentos/sincronizar")
+        assert resposta.status_code == 200
+        assert resposta.json() == resultado
+        assert chamadas == [1]
+
     def test_devolve_nota_com_cliente_e_valor(self, monkeypatch, sem_auth):
         _ligar(
             monkeypatch,

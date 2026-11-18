@@ -431,7 +431,7 @@ def _pedido_erp(conn: Any, empresa: str, pedido: str) -> Any:
                 ) as saldo
             from raw.car_pedido p
             left join raw.clientes_principal c on c.codigo_cliente = p.cliente
-            where p.empresa = :empresa and p.pedido = :pedido
+            where p.empresa = :empresa and p.pedido = :pedido and p.status = '2'
             """
         ),
         {"empresa": empresa, "pedido": pedido},
@@ -1047,6 +1047,7 @@ def _pedido(conn: Any, empresa: str, pedido: str) -> dict[str, Any]:
             left join public.wms_pedidos_arquivados arq
               on arq.empresa = p.empresa and arq.pedido = p.pedido
             where p.empresa = :empresa and p.pedido = :pedido
+              and (p.status = '2' or arq.arquivado_em is not null)
             """
         ),
         {"empresa": empresa, "pedido": pedido},

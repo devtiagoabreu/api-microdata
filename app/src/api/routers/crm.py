@@ -33,6 +33,7 @@ from src.api.auth.escopos import (
 )
 from src.api.auth.usuarios import Usuario
 from src.db import warehouse
+from src.etl import delta_erp
 
 router = APIRouter(tags=["crm"])
 
@@ -76,6 +77,13 @@ def _paginacao(total: int, pagina: int, por_pagina: int) -> dict[str, Any]:
     }
 
 
+PEDIDOS_NAO_CANCELADOS = "(p.status is null or p.status <> '3')"
+PEDIDOS_NAO_FATURADOS = (
+    "not exists (select 1 from raw.fat_pedido f "
+    "where f.empresa = p.empresa and f.nosso_pedido = p.pedido)"
+)
+
+
 def _filtros(
     *,
     busca: str | None,
@@ -86,9 +94,10 @@ def _filtros(
     campo_busca: str,
     campo_cnpj: str,
     campo_data: str,
+    condicoes_base: tuple[str, ...] = (),
 ) -> tuple[str, dict[str, Any]]:
     """Monta o `where` compartilhado por pedidos e faturamentos."""
-    clausulas: list[str] = []
+    clausulas: list[str] = list(condicoes_base)
     params: dict[str, Any] = {}
 
     if empresa:
@@ -198,6 +207,7 @@ def listar_pedidos(
         campo_busca="pedido",
         campo_cnpj="cliente",
         campo_data="data_pedido",
+        condicoes_base=(PEDIDOS_NAO_CANCELADOS, PEDIDOS_NAO_FATURADOS),
     )
     with warehouse.engine().connect() as conn:
         total = int(conn.execute(text(SQL_PEDIDOS_TOTAL.format(where=where)), params).scalar() or 0)
@@ -212,6 +222,11 @@ def listar_pedidos(
         "paginacao": _paginacao(total, pagina, por_pagina),
         "itens": [_linha_pedido(linha) for linha in linhas],
     }
+
+
+@router.post("/crm/pedidos/sincronizar")
+def sincronizar_pedidos(usuario: _estoque = None) -> dict[str, Any]:
+    return delta_erp.sincronizar_pedidos()
 
 
 @router.get("/crm/pedidos/{empresa}/{pedido}")
@@ -368,6 +383,11 @@ def listar_faturamentos(
         "paginacao": _paginacao(total, pagina, por_pagina),
         "itens": [_linha_faturamento(linha) for linha in linhas],
     }
+
+
+@router.post("/crm/faturamentos/sincronizar")
+def sincronizar_faturamentos(usuario: _faturamento = None) -> dict[str, Any]:
+    return delta_erp.sincronizar_faturamentos()
 
 
 @router.get("/crm/faturamentos/{empresa}/{pedido}/{nr_nota}")
