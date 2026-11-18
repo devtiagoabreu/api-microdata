@@ -4,8 +4,6 @@ from collections.abc import Callable
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import text
-
 from src.db import erp, warehouse
 from src.etl import sources
 from src.etl.extract import introspect
@@ -31,15 +29,6 @@ def _plano(tabela_erp: str) -> tuple[Any, list[str], list[str], list[str], list[
     return fonte, colunas_erp, [mapa[coluna] for coluna in colunas_erp], chave_raw, meta_erp
 
 
-def _max_data(engine: Any, tabela: str, coluna: str) -> datetime | date | None:
-    with engine.connect() as conn:
-        return conn.execute(text(f"select max({coluna}) from raw.{tabela}")).scalar()
-
-
-def _iso(valor: datetime | date | None) -> str | None:
-    return valor.isoformat() if valor is not None else None
-
-
 def _linhas_raw(
     linhas: list[dict[str, Any]],
     colunas_erp: list[str],
@@ -55,30 +44,27 @@ def _linhas_raw(
     return resultado
 
 
-def _carregar_filhos(engine: Any, tabela_filho: str, pais: list[dict[str, Any]]) -> int:
-    fonte, colunas_erp, colunas_raw, chave_raw, meta_erp = _plano(tabela_filho)
+PlanoFilho = tuple[Any, list[str], list[str], list[str], list[Any]]
+
+
+def _carregar_filhos(
+    plano_filho: PlanoFilho,
+    lote: list[dict[str, Any]],
+) -> tuple[str, list[str], list[str], list[dict[str, Any]]]:
+    fonte, colunas_erp, colunas_raw, chave_raw, meta_erp = plano_filho
     destino = qualificar_sql_server(fonte.tabela_erp)
     selecao = ", ".join(_ident(coluna) for coluna in colunas_erp)
-    total = 0
-
-    for inicio in range(0, len(pais), LOTE_CHAVES):
-        lote = pais[inicio : inicio + LOTE_CHAVES]
-        condicoes = " or ".join(
-            f"({_ident(CHAVE_PAI[0])} = ? and {_ident(CHAVE_PAI[1])} = ?)" for _ in lote
-        )
-        parametros = [
-            valor
-            for linha in lote
-            for valor in (linha["empresa"], linha["pedido"])
-        ]
-        sql = f"select {selecao} from {destino} where {condicoes}"
-        filhos = _linhas_raw(
-            erp.query(sql, parametros), colunas_erp, colunas_raw, meta_erp
-        )
-        upsert.apagar_documentos(engine, fonte.destino, list(CHAVE_PAI_RAW), lote)
-        total += upsert.upsert(engine, fonte.destino, chave_raw, colunas_raw, filhos)
-
-    return total
+    condicoes = " or ".join(
+        f"({_ident(CHAVE_PAI[0])} = ? and {_ident(CHAVE_PAI[1])} = ?)" for _ in lote
+    )
+    parametros = [
+        valor
+        for linha in lote
+        for valor in (linha["empresa"], linha["pedido"])
+    ]
+    sql = f"select {selecao} from {destino} where {condicoes}"
+    filhos = _linhas_raw(erp.query(sql, parametros), colunas_erp, colunas_raw, meta_erp)
+    return fonte.destino, chave_raw, colunas_raw, filhos
 
 
 def _sincronizar(
@@ -86,21 +72,29 @@ def _sincronizar(
     tabela_pai: str,
     tabela_filho: str,
     raw_pai: str,
-    coluna_data_raw: str,
     montar_sql: Callable[[list[str], datetime | date | None], tuple[str, list[Any]]],
 ) -> dict[str, Any]:
     engine = warehouse.engine()
-    desde = _max_data(engine, raw_pai, coluna_data_raw)
     _, colunas_erp, colunas_raw, chave_raw, meta_erp = _plano(tabela_pai)
-    sql, parametros = montar_sql(colunas_erp, desde)
+    sql, parametros = montar_sql(colunas_erp, None)
     pais = _linhas_raw(erp.query(sql, parametros), colunas_erp, colunas_raw, meta_erp)
 
     if not pais:
-        return {"desde": _iso(desde), "documentos": 0, "itens": 0}
+        return {"desde": None, "documentos": 0, "itens": 0}
 
-    itens = _carregar_filhos(engine, tabela_filho, pais)
-    documentos = upsert.upsert(engine, raw_pai, chave_raw, colunas_raw, pais)
-    return {"desde": _iso(desde), "documentos": documentos, "itens": itens}
+    plano_filho = _plano(tabela_filho)
+    documentos = 0
+    itens = 0
+
+    for inicio in range(0, len(pais), LOTE_CHAVES):
+        lote = pais[inicio : inicio + LOTE_CHAVES]
+        destino_filho, chave_filho, colunas_filho, filhos = _carregar_filhos(plano_filho, lote)
+        with engine.begin() as conn:
+            upsert.apagar_documentos_conn(conn, engine, destino_filho, list(CHAVE_PAI_RAW), lote)
+            itens += upsert.upsert_conn(conn, destino_filho, chave_filho, colunas_filho, filhos)
+            documentos += upsert.upsert_conn(conn, raw_pai, chave_raw, colunas_raw, lote)
+
+    return {"desde": None, "documentos": documentos, "itens": itens}
 
 
 def _sql_pedidos(
@@ -148,7 +142,6 @@ def sincronizar_pedidos() -> dict[str, Any]:
         tabela_pai="Car_Pedido",
         tabela_filho="Car_Itens_Pedido",
         raw_pai="car_pedido",
-        coluna_data_raw="data_pedido",
         montar_sql=_sql_pedidos,
     )
 
@@ -158,6 +151,5 @@ def sincronizar_faturamentos() -> dict[str, Any]:
         tabela_pai="Fat_Pedido",
         tabela_filho="Fat_Itens_Pedido",
         raw_pai="fat_pedido",
-        coluna_data_raw="data_emissao",
         montar_sql=_sql_faturamentos,
     )

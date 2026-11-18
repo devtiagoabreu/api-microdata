@@ -8,7 +8,7 @@ empresa) que o CRM consome.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 import pytest
@@ -218,8 +218,8 @@ class TestPedidos:
         assert "raw.fat_pedido f" in sql
         assert "f.nosso_pedido = p.pedido" in sql
 
-    def test_sincronizacao_diferencial_de_pedidos(self, monkeypatch, sem_auth):
-        resultado = {"desde": "2026-11-16T00:00:00", "documentos": 1, "itens": 3}
+    def test_sincronizacao_completa_de_pedidos(self, monkeypatch, sem_auth):
+        resultado = {"desde": None, "documentos": 1, "itens": 3}
         chamadas: list[int] = []
 
         def fake() -> dict[str, Any]:
@@ -232,11 +232,10 @@ class TestPedidos:
         assert resposta.json() == resultado
         assert chamadas == [1]
 
-    def test_sql_de_carga_respeita_data_e_exclusoes(self):
-        desde = datetime(2026, 11, 16)
-        sql, params = delta_erp._sql_pedidos(["Empresa", "Pedido"], desde)
-        assert "p.[Data_Pedido] >= ?" in sql
-        assert params == [desde]
+    def test_sql_de_carga_varre_todos_e_respeita_exclusoes(self):
+        sql, params = delta_erp._sql_pedidos(["Empresa", "Pedido"], None)
+        assert "p.[Data_Pedido] >= ?" not in sql
+        assert params == []
         assert "p.[Status] <> '3'" in sql
         assert "f.[Nosso_Pedido] = p.[Pedido]" in sql
 
@@ -291,8 +290,8 @@ class TestPedidos:
 
 
 class TestFaturamentos:
-    def test_sincronizacao_diferencial_de_faturamentos(self, monkeypatch, sem_auth):
-        resultado = {"desde": "2026-11-16T00:00:00", "documentos": 2, "itens": 4}
+    def test_sincronizacao_completa_de_faturamentos(self, monkeypatch, sem_auth):
+        resultado = {"desde": None, "documentos": 2, "itens": 4}
         chamadas: list[int] = []
 
         def fake() -> dict[str, Any]:

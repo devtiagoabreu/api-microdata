@@ -47,6 +47,22 @@ def _upsert_sql(tabela_raw: str, colunas: Sequence[str], chave: Sequence[str]) -
     )
 
 
+def upsert_conn(
+    conn: Any,
+    tabela_raw: str,
+    chave: list[str],
+    colunas: list[str],
+    linhas: list[dict[str, Any]],
+) -> int:
+    lote = max(get_settings().etl_batch_size, 1)
+    comando = text(_upsert_sql(tabela_raw, colunas, chave))
+    gravadas = 0
+    for inicio in range(0, len(linhas), lote):
+        for linha in linhas[inicio : inicio + lote]:
+            gravadas += conn.execute(comando, linha).rowcount
+    return gravadas
+
+
 def upsert(
     engine: Engine,
     tabela_raw: str,
@@ -56,14 +72,8 @@ def upsert(
 ) -> int:
     if not linhas:
         return 0
-    lote = max(get_settings().etl_batch_size, 1)
-    comando = text(_upsert_sql(tabela_raw, colunas, chave))
-    gravadas = 0
     with engine.begin() as conn:
-        for inicio in range(0, len(linhas), lote):
-            for linha in linhas[inicio : inicio + lote]:
-                gravadas += conn.execute(comando, linha).rowcount
-    return gravadas
+        return upsert_conn(conn, tabela_raw, chave, colunas, linhas)
 
 
 def tipos_de(engine: Engine, tabela_raw: str) -> dict[str, str]:
@@ -83,13 +93,13 @@ def tipos_de(engine: Engine, tabela_raw: str) -> dict[str, str]:
 _SEGURO = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
-def apagar_documentos(
+def apagar_documentos_conn(
+    conn: Any,
     engine: Engine,
     tabela_raw: str,
     chave_pai: Sequence[str],
     valores_pai: list[dict[str, Any]],
 ) -> int:
-    """Apaga os filhos de varios documentos de uma vez (unnest)."""
     if not valores_pai:
         return 0
     tipos = tipos_de(engine, tabela_raw)
@@ -101,12 +111,22 @@ def apagar_documentos(
     assinatura = ", ".join(f"v{i}" for i in range(len(chave_pai)))
     do_pai = ", ".join(f"c.{coluna}" for coluna in chave_pai)
     do_vetor = ", ".join(f"v.v{i}" for i in range(len(chave_pai)))
+    return conn.exec_driver_sql(
+        f"delete from raw.{tabela_raw} c using unnest({lista}) as v({assinatura}) "
+        f"where ({do_pai}) = ({do_vetor})",
+        {coluna: [linha[coluna] for linha in valores_pai] for coluna in chave_pai},
+    ).rowcount
+
+
+def apagar_documentos(
+    engine: Engine,
+    tabela_raw: str,
+    chave_pai: Sequence[str],
+    valores_pai: list[dict[str, Any]],
+) -> int:
+    """Apaga os filhos de varios documentos de uma vez (unnest)."""
     with engine.begin() as conn:
-        return conn.exec_driver_sql(
-            f"delete from raw.{tabela_raw} c using unnest({lista}) as v({assinatura}) "
-            f"where ({do_pai}) = ({do_vetor})",
-            {coluna: [linha[coluna] for linha in valores_pai] for coluna in chave_pai},
-        ).rowcount
+        return apagar_documentos_conn(conn, engine, tabela_raw, chave_pai, valores_pai)
 
 
 def _sql_apagar_ausentes(
