@@ -163,6 +163,26 @@ Run whether user is logged on or not
 Num host Linux seria crontab. O que importa é o `PYTHONPATH=.` e o diretório de trabalho, porque o
 CLI resolve `.env` e `alembic.ini` a partir de `app/`.
 
+Lembretes por e-mail das ações de prospecção (CRM) — duas tarefas adicionais no Agendador:
+
+```
+Dia anterior:
+Program:  M:\dev\api-microdata\app\.venv\Scripts\python.exe
+Argumentos: -X utf8 M:\dev\api-microdata\scripts\enviar_lembretes_acoes_prospeccao.py dia-anterior
+Start in: M:\dev\api-microdata\app
+Schedule:  diária às 13:55 (Brasília)
+
+Dia da ação:
+Program:  M:\dev\api-microdata\app\.venv\Scripts\python.exe
+Argumentos: -X utf8 M:\dev\api-microdata\scripts\enviar_lembretes_acoes_prospeccao.py dia-da-acao
+Start in: M:\dev\api-microdata\app
+Schedule:  diária às 07:30 (Brasília)
+```
+
+O script também aceita `dia-da-visita` como alias de `dia-da-acao`. Os endpoints correspondentes
+são `POST /lembretes-acoes-prospeccao/dia-anterior` e `POST /lembretes-acoes-prospeccao/dia-da-acao`,
+protegidos por `Bearer <JWT_SECRET>`.
+
 ---
 
 ## 6. Monitoramento

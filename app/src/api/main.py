@@ -15,6 +15,7 @@ from src.api.routers import (
     faturamento_detalhe,
     infra,
     kpis,
+    lembretes_acoes_prospeccao,
     lembretes_visitas,
     wms,
 )
@@ -49,3 +50,4 @@ app.include_router(custos_administrativos.router)
 app.include_router(contas_pagas_detalhe.router)
 app.include_router(wms.router)
 app.include_router(lembretes_visitas.router)
+app.include_router(lembretes_acoes_prospeccao.router)
