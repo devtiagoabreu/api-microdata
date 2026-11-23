@@ -320,6 +320,20 @@ class TestFaturamentos:
         assert item["data_nota"] == "2026-10-05"
         assert item["valor_nota"] == 4584.26
 
+    def test_filtro_por_pedido_origem(self, monkeypatch, sem_auth):
+        engine = _ligar(
+            monkeypatch,
+            {
+                "count(*)": [{"total": 1}],
+                "left join raw.fat_itens_pedido": [LINHA_FATURAMENTO],
+            },
+        )
+        client.get("/crm/faturamentos", params={"pedido_origem": "00007075"})
+        sql = " ".join(engine.conn.sqls)
+        assert "p.nosso_pedido = :pedido_origem" in sql
+        params = [p for p in engine.conn.params if "pedido_origem" in p]
+        assert params and params[0]["pedido_origem"] == "00007075"
+
     def test_detalhe_soma_itens_com_acrescimo(self, monkeypatch, sem_auth):
         _ligar(
             monkeypatch,

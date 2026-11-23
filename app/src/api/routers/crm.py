@@ -86,14 +86,15 @@ PEDIDOS_NAO_FATURADOS = (
 
 def _filtros(
     *,
-    busca: str | None,
-    cnpj: str | None,
-    data_inicio: date | None,
-    data_fim: date | None,
-    empresa: str | None,
+    busca: str | None = None,
+    cnpj: str | None = None,
+    data_inicio: date | None = None,
+    data_fim: date | None = None,
+    empresa: str | None = None,
     campo_busca: str,
     campo_cnpj: str,
     campo_data: str,
+    pedido_origem: str | None = None,
     condicoes_base: tuple[str, ...] = (),
 ) -> tuple[str, dict[str, Any]]:
     """Monta o `where` compartilhado por pedidos e faturamentos."""
@@ -121,6 +122,10 @@ def _filtros(
     if data_fim:
         clausulas.append(f"p.{campo_data} <= :data_fim")
         params["data_fim"] = data_fim
+
+    if pedido_origem:
+        clausulas.append("p.nosso_pedido = :pedido_origem")
+        params["pedido_origem"] = pedido_origem
 
     where = "where " + " and ".join(clausulas) if clausulas else ""
     return where, params
@@ -351,9 +356,14 @@ def listar_faturamentos(
     empresa: str | None = None,
     pagina: int = 1,
     por_pagina: int = 50,
+    pedido_origem: str | None = None,
     usuario: _faturamento = None,
 ) -> dict[str, Any]:
-    """Faturamentos (notas) do ERP (documento), prontos para busca e selecao pelo CRM."""
+    """Faturamentos (notas) do ERP (documento), prontos para busca e selecao pelo CRM.
+
+    `pedido_origem` filtra notas pelo número original do pedido do ERP (`nosso_pedido`),
+    usado pelo CRM para encontrar a nota de um pedido já vinculado.
+    """
     if pagina < 1:
         raise HTTPException(status_code=422, detail="pagina comeca em 1")
     por_pagina = max(1, min(por_pagina, 500))
@@ -367,6 +377,7 @@ def listar_faturamentos(
         campo_busca="nr_nota",
         campo_cnpj="cliente",
         campo_data="data_nota",
+        pedido_origem=pedido_origem,
     )
     with warehouse.engine().connect() as conn:
         total = int(
