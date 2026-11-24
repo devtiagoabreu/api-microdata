@@ -167,9 +167,11 @@ class TestContrato:
             "/crm/pedidos",
             "/crm/pedidos/sincronizar",
             "/crm/pedidos/{empresa}/{pedido}",
+            "/crm/pedidos-faturados/{empresa}/{pedido}",
             "/crm/faturamentos",
             "/crm/faturamentos/sincronizar",
             "/crm/faturamentos/{empresa}/{pedido}/{nr_nota}",
+            "/crm/faturamentos/{empresa}/{pedido}/{nr_nota}/pedidos",
         ):
             assert rota in rotas, rota
 
@@ -287,6 +289,78 @@ class TestPedidos:
         with pytest.raises(HTTPException) as erro:
             crm.detalhe_pedido("01", "0001", empresa_consultada="01", usuario=usuario)
         assert erro.value.status_code == 403
+
+
+class TestPedidosFaturados:
+    CABECALHO_ERP = {
+        "empresa": "13",
+        "pedido": "00007046",
+        "cliente": "08.661.014/0001-68",
+        "cliente_nome": "CLIENTE NOTA",
+        "data_pedido": date(2026, 11, 5),
+        "data_entrega": date(2026, 11, 13),
+        "status": "3",
+        "status_ped": "E",
+        "cond_pagto": "04",
+        "pedido_representante": None,
+        "pedido_id": "abc123",
+    }
+    ITEM_ERP = {
+        "item": 1,
+        "produto": "000015",
+        "situacao": "001",
+        "cor": "00007",
+        "desenho": None,
+        "qtde": "400.0000",
+        "unid": "MT",
+        "vr_unitario": "15.2800000000",
+        "vr_total": "6112.0000",
+        "status_item": "E",
+        "data_entrega": date(2026, 11, 13),
+    }
+
+    def test_le_pedido_faturado_direto_do_erp(self, monkeypatch, sem_auth):
+        chamadas: list[tuple[str, Any]] = []
+
+        def fake_query(sql: str, params: Any = None, read_only: bool = True):
+            chamadas.append((sql, params))
+            assert read_only is True
+            if "from dbo.Car_Itens_Pedido" in sql:
+                return [dict(self.ITEM_ERP)]
+            return [dict(self.CABECALHO_ERP)]
+
+        monkeypatch.setattr(crm.erp, "query", fake_query)
+        resposta = client.get("/crm/pedidos-faturados/13/00007046")
+        assert resposta.status_code == 200
+        corpo = resposta.json()
+        assert corpo["pedido"] == "00007046"
+        assert corpo["pedido_origem"] == "00007046"
+        assert corpo["identificador_erp"] == "abc123"
+        assert corpo["cliente_cnpj"] == "08.661.014/0001-68"
+        assert corpo["valor_total"] == 6112.0
+        assert corpo["quantidade"] == 400.0
+        assert corpo["itens"][0]["produto"] == "000015"
+        assert all(params == ("13", "00007046") for _, params in chamadas)
+
+    def test_pedido_faturado_inexistente_devolve_404(self, monkeypatch, sem_auth):
+        monkeypatch.setattr(crm.erp, "query", lambda *args, **kwargs: [])
+        resposta = client.get("/crm/pedidos-faturados/13/99999999")
+        assert resposta.status_code == 404
+
+    def test_pedidos_de_uma_nota(self, monkeypatch, sem_auth):
+        engine = _ligar(
+            monkeypatch,
+            {
+                "distinct nullif(trim(p.nosso_pedido)": [
+                    {"pedido": "00007045"},
+                    {"pedido": "00007046"},
+                ]
+            },
+        )
+        resposta = client.get("/crm/faturamentos/13/013541/012754/pedidos")
+        assert resposta.status_code == 200
+        assert resposta.json()["pedidos"] == ["00007045", "00007046"]
+        assert "p.nr_nota = :nr_nota" in " ".join(engine.conn.sqls)
 
 
 class TestFaturamentos:

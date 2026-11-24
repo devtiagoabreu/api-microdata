@@ -32,7 +32,7 @@ from src.api.auth.escopos import (
     exigir_escopo,
 )
 from src.api.auth.usuarios import Usuario
-from src.db import warehouse
+from src.db import erp, warehouse
 from src.etl import delta_erp
 
 router = APIRouter(tags=["crm"])
@@ -172,6 +172,7 @@ def _linha_pedido(linha: dict[str, Any]) -> dict[str, Any]:
     return {
         "empresa": _texto(linha.get("empresa")),
         "pedido": _texto(linha.get("pedido")),
+        "pedido_origem": _texto(linha.get("pedido")),
         "cliente_cnpj": _texto(linha.get("cliente")),
         "cliente_nome": _texto(linha.get("cliente_nome")),
         "data_pedido": _data(linha.get("data_pedido")),
@@ -185,6 +186,68 @@ def _linha_pedido(linha: dict[str, Any]) -> dict[str, Any]:
         "quantidade": _numero(linha.get("quantidade")),
         "valor_total": _numero(linha.get("valor_total")),
     }
+
+
+def _itens_pedido_erp(linhas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "item": int(linha.get("item") or 0),
+            "produto": _texto(linha.get("produto")),
+            "situacao": _texto(linha.get("situacao")),
+            "cor": _texto(linha.get("cor")),
+            "desenho": _texto(linha.get("desenho")),
+            "quantidade": _numero(linha.get("qtde")),
+            "unidade": _texto(linha.get("unid")),
+            "valor_unitario": _numero(linha.get("vr_unitario")),
+            "valor_total": _numero(linha.get("vr_total")),
+            "status": _texto(linha.get("status_item")),
+            "data_entrega": _data(linha.get("data_entrega")),
+        }
+        for linha in linhas
+    ]
+
+
+@router.get("/crm/pedidos-faturados/{empresa}/{pedido}")
+def detalhe_pedido_faturado(
+    empresa: str,
+    pedido: str,
+    empresa_consultada: str | None = None,
+    usuario: _estoque = None,
+) -> dict[str, Any]:
+    """Pedido já faturado, lido direto do ERP (o warehouse só guarda pedidos em aberto)."""
+    empresa_alvo = empresa_efetiva(usuario, empresa_consultada)
+    if empresa_alvo and empresa_alvo != empresa:
+        raise HTTPException(status_code=403, detail="voce so acessa a empresa {empresa_alvo}")
+
+    cabecalhos = erp.query(
+        "select p.Empresa as empresa, p.Pedido as pedido, p.Cliente as cliente, "
+        "c.Razao_Nome_Cliente as cliente_nome, p.Data_Pedido as data_pedido, "
+        "p.Data_Entrega as data_entrega, p.Status as status, p.Status_Ped as status_ped, "
+        "p.Cond_Pagto as cond_pagto, p.Pedido_Representante as pedido_representante, "
+        "p.pedido_id as pedido_id from dbo.Car_Pedido p "
+        "left join dbo.Clientes_Principal c on c.Codigo_Cliente = p.Cliente "
+        "where p.Empresa = ? and p.Pedido = ?",
+        (empresa, pedido),
+    )
+    if not cabecalhos:
+        raise HTTPException(status_code=404, detail="Pedido nao encontrado")
+
+    itens = _itens_pedido_erp(
+        erp.query(
+            "select i.Item as item, i.Produto as produto, i.Situacao as situacao, "
+            "i.Cor as cor, i.Desenho as desenho, i.Qtde as qtde, i.Unid as unid, "
+            "i.Vr_Unitario as vr_unitario, i.Vr_Total as vr_total, "
+            "i.Status_Item as status_item, i.Data_Entrega as data_entrega "
+            "from dbo.Car_Itens_Pedido i "
+            "where i.Empresa = ? and i.Pedido = ? order by i.Item",
+            (empresa, pedido),
+        )
+    )
+    documento = _linha_pedido(dict(cabecalhos[0]))
+    documento["total_itens"] = len(itens)
+    documento["quantidade"] = sum(item["quantidade"] for item in itens)
+    documento["valor_total"] = sum(item["valor_total"] for item in itens)
+    return {**documento, "itens": itens}
 
 
 @router.get("/crm/pedidos")
@@ -319,11 +382,12 @@ left join raw.clientes_principal c on c.codigo_cliente = p.cliente
 """
 
 SQL_FATURAMENTO_ITENS = """
-select i.item, i.cod_produto, i.des_produto, i.unidade, i.qtde, i.metros,
+select distinct i.item, i.cod_produto, i.des_produto, i.unidade, i.qtde, i.metros,
   i.vr_unitario, i.vr_total, i.acres_desc
 from raw.fat_itens_pedido i
-where i.empresa = :empresa and i.pedido = :pedido
-order by i.item
+join raw.fat_pedido p on p.empresa = i.empresa and p.pedido = i.pedido
+where p.empresa = :empresa and p.nr_nota = :nr_nota
+order by i.item, i.cod_produto
 """
 
 
@@ -401,6 +465,39 @@ def sincronizar_faturamentos(usuario: _faturamento = None) -> dict[str, Any]:
     return delta_erp.sincronizar_faturamentos()
 
 
+@router.get("/crm/faturamentos/{empresa}/{pedido}/{nr_nota}/pedidos")
+def pedidos_da_nota(
+    empresa: str,
+    pedido: str,
+    nr_nota: str,
+    empresa_consultada: str | None = None,
+    usuario: _faturamento = None,
+) -> dict[str, Any]:
+    """Pedidos de venda (nosso_pedido) que compõem uma nota faturada."""
+    empresa_alvo = empresa_efetiva(usuario, empresa_consultada)
+    if empresa_alvo and empresa_alvo != empresa:
+        raise HTTPException(status_code=403, detail="voce so acessa a empresa {empresa_alvo}")
+    with warehouse.engine().connect() as conn:
+        linhas = [
+            dict(linha)
+            for linha in conn.execute(
+                text(
+                    "select distinct nullif(trim(p.nosso_pedido), '') as pedido "
+                    "from raw.fat_pedido p "
+                    "where p.empresa = :empresa and p.nr_nota = :nr_nota "
+                    "order by 1"
+                ),
+                {"empresa": empresa, "nr_nota": nr_nota},
+            ).mappings()
+        ]
+    return {
+        "empresa": empresa,
+        "pedido": pedido,
+        "nr_nota": nr_nota,
+        "pedidos": [_texto(linha.get("pedido")) for linha in linhas if _texto(linha.get("pedido"))],
+    }
+
+
 @router.get("/crm/faturamentos/{empresa}/{pedido}/{nr_nota}")
 def detalhe_faturamento(
     empresa: str,
@@ -446,7 +543,7 @@ def detalhe_faturamento(
             }
             for linha in conn.execute(
                 text(SQL_FATURAMENTO_ITENS),
-                {"empresa": empresa, "pedido": pedido},
+                {"empresa": empresa, "nr_nota": nr_nota},
             ).mappings()
         ]
     documento = _linha_faturamento(dict(cabecalho))
