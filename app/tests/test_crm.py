@@ -1,9 +1,9 @@
 """Testes das rotas de CRM: documentos do ERP (pedidos e faturamentos) para o dgbcomex.
 
 O CRM precisa listar pedidos/notas do ERP para vincular a pessoa/oportunidade. As rotas leem
-a carga do ERP no warehouse local (schema `raw`), entao os testes usam um engine falso: nao
-dependem da carga estar made e checam o contrato (filtros, mapeamento, paginacao, corte de
-empresa) que o CRM consome.
+a carga do ERP no warehouse local (schema `raw`), exceto pedidos/notas já faturados, lidos
+direto do ERP. Os testes usam um engine falso: nao dependem da carga estar made e checam o
+contrato (filtros, mapeamento, paginacao, corte de empresa) que o CRM consome.
 """
 
 from __future__ import annotations
@@ -168,6 +168,7 @@ class TestContrato:
             "/crm/pedidos/sincronizar",
             "/crm/pedidos/{empresa}/{pedido}",
             "/crm/pedidos-faturados/{empresa}/{pedido}",
+            "/crm/faturamentos-por-pedido/{pedido}",
             "/crm/faturamentos",
             "/crm/faturamentos/sincronizar",
             "/crm/faturamentos/{empresa}/{pedido}/{nr_nota}",
@@ -348,22 +349,40 @@ class TestPedidosFaturados:
         assert resposta.status_code == 404
 
     def test_pedidos_de_uma_nota(self, monkeypatch, sem_auth):
-        engine = _ligar(
-            monkeypatch,
-            {
-                "distinct nullif(trim(p.nosso_pedido)": [
-                    {"pedido": "00007045"},
-                    {"pedido": "00007046"},
-                ]
-            },
-        )
+        chamadas: list[tuple[str, Any]] = []
+
+        def fake_query(sql: str, params: Any = None, read_only: bool = True):
+            chamadas.append((sql, params))
+            assert read_only is True
+            return [{"pedido": "00007045"}, {"pedido": "00007046"}]
+
+        monkeypatch.setattr(crm.erp, "query", fake_query)
         resposta = client.get("/crm/faturamentos/13/013541/012754/pedidos")
         assert resposta.status_code == 200
         assert resposta.json()["pedidos"] == ["00007045", "00007046"]
-        assert "p.nr_nota = :nr_nota" in " ".join(engine.conn.sqls)
+        assert "from dbo.Fat_Pedido" in chamadas[0][0]
+        assert chamadas[0][1] == ("13", "012754")
 
 
 class TestFaturamentos:
+    def test_busca_nota_direto_no_erp_por_pedido(self, monkeypatch, sem_auth):
+        chamadas: list[tuple[str, Any]] = []
+
+        def fake_query(sql: str, params: Any = None, read_only: bool = True):
+            chamadas.append((sql, params))
+            assert read_only is True
+            return [dict(LINHA_FATURAMENTO)]
+
+        monkeypatch.setattr(crm.erp, "query", fake_query)
+        resposta = client.get("/crm/faturamentos-por-pedido/00006783")
+        assert resposta.status_code == 200
+        item = resposta.json()["itens"][0]
+        assert item["nr_nota"] == "012531"
+        assert item["pedido_origem"] == "00006783"
+        assert "from dbo.Fat_Pedido" in chamadas[0][0]
+        assert "ltrim(rtrim(p.Nosso_Pedido)) = ?" in chamadas[0][0]
+        assert chamadas[0][1] == ("00006783",)
+
     def test_sincronizacao_completa_de_faturamentos(self, monkeypatch, sem_auth):
         resultado = {"desde": None, "documentos": 2, "itens": 4}
         chamadas: list[int] = []

@@ -390,6 +390,25 @@ where p.empresa = :empresa and p.nr_nota = :nr_nota
 order by i.item, i.cod_produto
 """
 
+SQL_FATURAMENTOS_POR_PEDIDO = """
+select p.Empresa as empresa, p.Pedido as pedido, p.Nr_Nota as nr_nota,
+  p.Serie as serie, p.Cliente as cliente, c.Razao_Nome_Cliente as cliente_nome,
+  p.Data_Nota as data_nota, p.Data_Emissao as data_emissao,
+  p.Vr_Nota as vr_nota, p.Soma_Itens as soma_itens, p.Nosso_Pedido as nosso_pedido,
+  p.Status_Gravado as status_gravado, p.Cond_Pagto_Extenso as cond_pagto_extenso,
+  count(i.Item) as itens,
+  coalesce(sum(coalesce(i.Qtde, 0)), 0) as quantidade,
+  coalesce(sum(coalesce(i.Vr_Total, 0) + coalesce(i.Acres_Desc, 0)), 0) as valor_total
+from dbo.Fat_Pedido p
+left join dbo.Clientes_Principal c on c.Codigo_Cliente = p.Cliente
+left join dbo.Fat_Itens_Pedido i on i.Empresa = p.Empresa and i.Pedido = p.Pedido
+where {condicoes}
+group by p.Empresa, p.Pedido, p.Nr_Nota, p.Serie, p.Cliente, c.Razao_Nome_Cliente,
+  p.Data_Nota, p.Data_Emissao, p.Vr_Nota, p.Soma_Itens, p.Nosso_Pedido,
+  p.Status_Gravado, p.Cond_Pagto_Extenso
+order by p.Data_Nota desc, p.Nr_Nota desc
+"""
+
 
 def _linha_faturamento(linha: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -408,6 +427,33 @@ def _linha_faturamento(linha: dict[str, Any]) -> dict[str, Any]:
         "total_itens": int(linha.get("itens") or 0),
         "quantidade": _numero(linha.get("quantidade")),
         "valor_total": _numero(linha.get("valor_total")),
+    }
+
+
+@router.get("/crm/faturamentos-por-pedido/{pedido}")
+def faturamentos_por_pedido(
+    pedido: str,
+    empresa: str | None = None,
+    empresa_consultada: str | None = None,
+    usuario: _faturamento = None,
+) -> dict[str, Any]:
+    empresa_alvo = empresa_efetiva(usuario, empresa_consultada)
+    if empresa_alvo and empresa and empresa_alvo != empresa:
+        raise HTTPException(status_code=403, detail=f"voce so acessa a empresa {empresa_alvo}")
+    condicoes = ["ltrim(rtrim(p.Nosso_Pedido)) = ?"]
+    parametros: list[Any] = [pedido.strip()]
+    alvo = empresa_alvo or empresa
+    if alvo:
+        condicoes.append("p.Empresa = ?")
+        parametros.append(alvo)
+    linhas = erp.query(
+        SQL_FATURAMENTOS_POR_PEDIDO.format(condicoes=" and ".join(condicoes)),
+        tuple(parametros),
+    )
+    itens = [_linha_faturamento(dict(linha)) for linha in linhas]
+    return {
+        "paginacao": _paginacao(len(itens), 1, max(1, len(itens))),
+        "itens": itens,
     }
 
 
@@ -477,19 +523,12 @@ def pedidos_da_nota(
     empresa_alvo = empresa_efetiva(usuario, empresa_consultada)
     if empresa_alvo and empresa_alvo != empresa:
         raise HTTPException(status_code=403, detail="voce so acessa a empresa {empresa_alvo}")
-    with warehouse.engine().connect() as conn:
-        linhas = [
-            dict(linha)
-            for linha in conn.execute(
-                text(
-                    "select distinct nullif(trim(p.nosso_pedido), '') as pedido "
-                    "from raw.fat_pedido p "
-                    "where p.empresa = :empresa and p.nr_nota = :nr_nota "
-                    "order by 1"
-                ),
-                {"empresa": empresa, "nr_nota": nr_nota},
-            ).mappings()
-        ]
+    linhas = erp.query(
+        "select distinct nullif(ltrim(rtrim(p.Nosso_Pedido)), '') as pedido "
+        "from dbo.Fat_Pedido p "
+        "where p.Empresa = ? and p.Nr_Nota = ? order by 1",
+        (empresa, nr_nota),
+    )
     return {
         "empresa": empresa,
         "pedido": pedido,
